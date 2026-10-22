@@ -1,6 +1,6 @@
 // The household's cameras. Owners register cameras (a name and where it is); each camera is then
-// fed by a video device on some household member's computer: DroidCam's virtual webcam, a laptop
-// webcam, any capture device. Every camera tile runs its own preview, snapshot/record and motion
+// fed by a video device on some household member's computer: a phone camera, a laptop webcam,
+// any capture device. Every camera tile runs its own preview, snapshot/record and motion
 // detection, and every capture goes through the same pipeline: encrypted on this device with a
 // fresh AES key, the key wrapped by the Tide network under the household's vault policy, and only
 // ciphertext uploaded.
@@ -50,7 +50,7 @@ export function Cameras({ me, onUploaded }: { me: Me; onUploaded: () => void }) 
         <h2>Cameras</h2>
         <span className="muted tiny">{cams ? `${cams.length} camera${cams.length === 1 ? "" : "s"}` : ""}</span>
       </div>
-      <p className="muted small">Each camera is fed by a video device on this computer: a phone through DroidCam, a webcam, any capture device. Everything it records is encrypted here before upload. Point cameras at something non-personal for the demo.</p>
+      <p className="muted small">Each camera is fed by a video device on this computer: a phone camera, a webcam, any capture device. Everything it records is encrypted here before upload. Point cameras at something non-personal for the demo.</p>
       {err && <ErrorBox title="Cameras" detail={err} />}
       {cams && cams.length === 0 && (
         <p className="muted">{me.isOwner ? "No cameras yet. Add the first one below." : "No cameras yet. Ask an owner to add one."}</p>
@@ -73,6 +73,8 @@ export function Cameras({ me, onUploaded }: { me: Me; onUploaded: () => void }) 
 const deviceKey = (camId: string) => `camvault.device.${tenant().info.id}.${camId}`;
 const savedDevice = (camId: string) => { try { return localStorage.getItem(deviceKey(camId)) ?? ""; } catch { return ""; } };
 const saveDevice = (camId: string, id: string) => { try { localStorage.setItem(deviceKey(camId), id); } catch { /* ignore */ } };
+// Show the device the way the system names it, or a numbered fallback before permission is granted.
+const deviceName = (label: string | undefined, fallback: string) => label || fallback;
 
 function CameraTile({ me, cam, canRemove, onRemove, onUploaded }: { me: Me; cam: CameraRec; canRemove: boolean; onRemove: () => void; onUploaded: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -146,8 +148,8 @@ If the encrypted copy was already kept on this device, it is safe: Household cop
     setStatus("waiting for picture…");
     const t = setTimeout(() => {
       const track = s.getVideoTracks()[0];
-      if (el.videoWidth > 0) setStatus(`receiving ${el.videoWidth}×${el.videoHeight} from "${track?.label ?? "camera"}"`);
-      else setStatus(`no picture from "${track?.label ?? "camera"}" (track ${track?.readyState ?? "?"}${track?.muted ? ", muted" : ""}). Is the device connected?`);
+      if (el.videoWidth > 0) setStatus(`receiving ${el.videoWidth}×${el.videoHeight} from "${deviceName(track?.label, "camera")}"`);
+      else setStatus(`no picture from "${deviceName(track?.label, "camera")}" (track ${track?.readyState ?? "?"}${track?.muted ? ", muted" : ""}). Is the device connected?`);
     }, 2000);
     return () => clearTimeout(t);
   }, [on, gen]);
@@ -205,7 +207,7 @@ If the encrypted copy was already kept on this device, it is safe: Household cop
         <>
           <label className="muted tiny">Video device:{" "}
             <select className="select" value={deviceId} onChange={(e) => void start(e.target.value)}>
-              {devices.map((d, i) => <option key={d.deviceId || i} value={d.deviceId}>{d.label || `camera ${i + 1}`}</option>)}
+              {devices.map((d, i) => <option key={d.deviceId || i} value={d.deviceId}>{deviceName(d.label, `camera ${i + 1}`)}</option>)}
             </select>
           </label>
           <video ref={videoRef} className="media live-preview" autoPlay muted playsInline />
@@ -219,7 +221,7 @@ If the encrypted copy was already kept on this device, it is safe: Household cop
       )}
       {camErr && (
         <ErrorBox title="Could not open the camera"
-          detail={`${camErr}\n\nAllow camera access for this site. For DroidCam: connect the DroidCam client to the phone first, then choose its device here.`} />
+          detail={`${camErr}\n\nAllow camera access for this site. For a phone camera: connect the phone to this computer first, then choose its device here.`} />
       )}
       <Steps steps={steps} />
       {err && <ErrorBox {...err} />}

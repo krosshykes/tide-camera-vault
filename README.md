@@ -26,7 +26,7 @@ Each clip is AES-encrypted in the browser. Its key is wrapped by the Tide networ
 
 ### 5. Prototype & storytelling
 
-Households register several cameras (webcam, or a phone via DroidCam), each with motion detection, and every clip is encrypted before upload. Alex plays clips. CamCo's console shows ciphertext, a refused decrypt, and a self-grant stuck at "Pending household approval: 0 of 2". Jordan joins only after two owners approve. Even if CamCo deletes footage, the household's own copy survives and restores it.
+Households register several cameras (a webcam or a phone camera), each with motion detection, and every clip is encrypted before upload. Alex plays clips. CamCo's console shows ciphertext, a refused decrypt, and a self-grant stuck at "Pending household approval: 0 of 2". Jordan joins only after two owners approve. Even if CamCo deletes footage, the household's own copy survives and restores it.
 
 ## Setup
 
@@ -34,7 +34,7 @@ Households register several cameras (webcam, or a phone via DroidCam), each with
 - **Node.js 20+** and npm
 - **Docker Desktop**, running
 - **Chrome or Edge** recommended: Tide pop-ups must be allowed for `localhost`, and the optional backup folder needs Chromium. Firefox works for everything else.
-- **A camera to record:** a webcam, or a phone through the [DroidCam](https://droidcam.app) client. No footage ships with the repo.
+- **A camera to record:** a webcam or a phone camera. No footage ships with the repo.
 - **A Tide licence:** a real email address you control, and agreement to Tide's Terms at <https://tide.org/legal>.
 
 ### 1. Install
@@ -95,7 +95,7 @@ Use one private browser window per character, all at <http://localhost:5173>. Ho
 
 ### 1. Encrypted capture
 1. Sign in as **Alex**.
-2. **Cameras** → **Start** on a camera tile and pick its **Video device** (a webcam, or **DroidCam** for a phone). Each camera tile runs on its own.
+2. **Cameras** → **Start** on a camera tile and pick its **Video device** (a webcam, or the **phone camera**). Each camera tile runs on its own.
 3. **Snapshot**, **Record 3s**, or tick **Motion detection** and move something in view.
 4. Watch the five steps go green:
    1. captured,
@@ -167,5 +167,5 @@ branding/  generated Tide sign-in branding
 - **CamCo can still delete ciphertext on its own disks**, a denial of service and never a disclosure. Household copies survive it and restore it. CamCo could forge a deletion record to hide one from the integrity check; signing deletion records with the member's own key would close that. Household copies exist only on devices that recorded or copied the clips.
 - **Revocation isn't instant:** it applies at the person's next sign-in or token refresh (≤ 10 min). Anything already seen can't be clawed back.
 - **CamCo staff realm:** our free-tier licence refused a third realm, so `/staff` signs in with the demo realm's `camco-support` account until Tide raises the limit.
-- **You need a camera to record:** a webcam or a phone via DroidCam. Without one you can still sign in, approve, and view clips others recorded.
+- **You need a camera to record:** a webcam or a phone camera. Without one you can still sign in, approve, and view clips others recorded.
 - **Prototype only:** local development setup (HTTP on localhost), not hardened for production.

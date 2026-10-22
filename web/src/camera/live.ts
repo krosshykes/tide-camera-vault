@@ -1,4 +1,4 @@
-// A real camera (e.g. DroidCam's virtual webcam, or the laptop webcam) as an optional source.
+// A real camera (e.g. a phone camera, or the laptop webcam) as an optional source.
 // Frames are drawn onto a canvas with a CCTV-style stamp, then go through exactly the same
 // pipeline: encrypted in this browser before anything is uploaded.
 // getUserMedia needs a secure context; http://localhost counts as one.
@@ -15,7 +15,7 @@ export async function listCameras(): Promise<MediaDeviceInfo[]> {
 
 export async function openCamera(deviceId?: string): Promise<MediaStream> {
   return navigator.mediaDevices.getUserMedia({
-    // No resolution constraints: DroidCam's free tier only offers 640x480, and some virtual
+    // No resolution constraints: some phone cameras only offer 640x480, and some virtual
     // cameras fail to start when asked for more.
     video: deviceId ? { deviceId: { exact: deviceId } } : true,
     audio: false,

@@ -139,7 +139,7 @@ flowchart TB
 sequenceDiagram
   autonumber
   actor A as Alex (browser)
-  participant Cam as Registered camera<br/>(webcam / DroidCam)
+  participant Cam as Registered camera<br/>(webcam / phone camera)
   participant WC as WebCrypto
   participant API as CamCo backend
   participant ORK as Tide network (20 ORKs)
@@ -334,7 +334,7 @@ stateDiagram-v2
 
 ## 12. Live camera and motion detection
 
-A household registers **several cameras** (owners add or remove them; a name and a location, which CamCo can see as metadata). Each camera tile is fed by a video device on a member's computer: DroidCam's virtual webcam for a phone, a laptop webcam, any capture device. Which device feeds which camera is remembered in that browser. Each tile has its own preview, snapshot and record buttons, **its own motion detection** and its own upload progress, so several cameras can run and trigger at once. Every clip is tagged with its camera and goes through the same encrypt pipeline.
+A household registers **several cameras** (owners add or remove them; a name and a location, which CamCo can see as metadata). Each camera tile is fed by a video device on a member's computer: a phone camera, a laptop webcam, any capture device. Which device feeds which camera is remembered in that browser. Each tile has its own preview, snapshot and record buttons, **its own motion detection** and its own upload progress, so several cameras can run and trigger at once. Every clip is tagged with its camera and goes through the same encrypt pipeline.
 
 ```mermaid
 stateDiagram-v2
@@ -538,7 +538,7 @@ Problems met while building this, and their fixes.
 | Approved "1 of 1" but not applied | Auto-commit didn't run | **Apply now (quorum reached)** re-runs the commit gates |
 | Server prints "running" but old code serves | Express 5 calls the listen callback even on `EADDRINUSE` | The callback now exits on error; stop the old process first |
 | Vite: `Cannot read properties of undefined (reading 'url')` | A `configureServer` hook returned a function (Vite runs it as a post hook) | Block body in the plugin |
-| Live camera black / nothing happens | Wrong device, client not connected, or no frames | Pick **DroidCam Source**; read the status line (*receiving frames* vs *no picture*) |
+| Live camera black / nothing happens | Wrong device, phone not connected, or no frames | Pick the **phone camera** or webcam; read the status line (*receiving frames* vs *no picture*) |
 | A refused decrypt looks like an outage | Contract refusals arrive as `THRESHOLD_FAILURE` | The app reads the ORKs' reasons and says "refused", without retrying |
 
 ---
