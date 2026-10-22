@@ -1,0 +1,12 @@
+{
+  "name": "home-camera-vault",
+  "private": true,
+  "description": "Home Camera Vault: household-controlled camera footage, secured with TideCloak. RMIT x Tide UNLOCKED hackathon.",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix web install",
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "server": "npm --prefix server run start",
+    "web": "npm --prefix web run dev",
+    "typecheck": "npm --prefix server run typecheck && npm --prefix web exec tsc -- --noEmit"
+  }
+}

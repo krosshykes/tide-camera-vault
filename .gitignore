@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+
+# Secrets — operator credentials never belong in the repo
+.env
+.env.local
+.env.*.local
+
+# Tide pack files (fetched from the Tide MCP server)
+.tide-pack/
+
+# Runtime state
+server/data/
+web/public/tidecloak.json

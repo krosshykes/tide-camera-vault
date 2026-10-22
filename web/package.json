@@ -1,0 +1,27 @@
+{
+  "name": "camera-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tidecloak/js": "0.14.41",
+    "@tidecloak/react": "0.14.33",
+    "@tideorg/js": "0.14.29",
+    "heimdall-tide": "0.14.41",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.2",
+    "vite": "6.3.5"
+  }
+}
