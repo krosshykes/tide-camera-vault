@@ -34,6 +34,13 @@ function Centered({ children }: { children: React.ReactNode }) {
 
 function Landing() {
   const { login } = useTideCloak();
+  // After picking a different household the page reloads with ?login=1: go straight to Tide.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("login") === "1") {
+      window.history.replaceState(null, "", "/");
+      login();
+    }
+  }, [login]);
   return <Home onSignIn={login} />;
 }
 
@@ -53,6 +60,7 @@ function SignedIn() {
         <div className="brand">
           <span className="logo-dot" />
           <span>{me.isVendor ? "CamCo Vendor Console" : "Home Camera Vault"}</span>
+          {!me.isVendor && <span className="household-name">· {me.household.name}</span>}
           <span className={`area-tag ${me.isVendor ? "vendor" : "household"}`}>{me.isVendor ? "VENDOR · INTERNAL" : "HOUSEHOLD APP"}</span>
         </div>
         <div className="who">

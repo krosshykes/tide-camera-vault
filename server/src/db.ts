@@ -1,6 +1,7 @@
-// A JSON file is the whole database. Everything sensitive in it is ciphertext.
+// One JSON file per household is the whole database. Everything sensitive in it is ciphertext.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { DATA_DIR, DB_PATH } from "./paths.ts";
+import { join } from "node:path";
+import type { Household } from "./households.ts";
 
 export interface Clip {
   id: string;
@@ -24,21 +25,26 @@ export interface VaultPolicy {
 
 export interface AuditEntry { at: number; who: string; what: string; detail: string }
 
-interface Db { clips: Clip[]; vaultPolicy: VaultPolicy | null; audit: AuditEntry[] }
+export interface Db { clips: Clip[]; vaultPolicy: VaultPolicy | null; audit: AuditEntry[] }
 
-let _db: Db | null = null;
+const cache = new Map<string, Db>();
+const pathOf = (h: Household) => join(h.dataDir, "db.json");
 
-export function db(): Db {
-  if (!_db) _db = existsSync(DB_PATH) ? JSON.parse(readFileSync(DB_PATH, "utf8")) : { clips: [], vaultPolicy: null, audit: [] };
-  return _db!;
+export function db(h: Household): Db {
+  if (!cache.has(h.id)) {
+    const p = pathOf(h);
+    cache.set(h.id, existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : { clips: [], vaultPolicy: null, audit: [] });
+  }
+  return cache.get(h.id)!;
 }
 
-export function save() {
-  mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(DB_PATH, JSON.stringify(db(), null, 2));
+export function save(h: Household) {
+  mkdirSync(h.dataDir, { recursive: true });
+  writeFileSync(pathOf(h), JSON.stringify(db(h), null, 2));
 }
 
-export function audit(who: string, what: string, detail: string) {
-  db().audit.unshift({ at: Date.now(), who, what, detail });
-  db().audit.length = Math.min(db().audit.length, 500);
+export function audit(h: Household, who: string, what: string, detail: string) {
+  const d = db(h);
+  d.audit.unshift({ at: Date.now(), who, what, detail });
+  d.audit.length = Math.min(d.audit.length, 500);
 }

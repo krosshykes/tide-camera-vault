@@ -3,7 +3,8 @@
 // vault's record id and wrapped by the Tide network under that policy. The network will only
 // unwrap it for a caller who holds household-viewer AND _tide_decryptor - checked on every ORK,
 // every time. Nobody holds a key that can skip that check: not CamCo, not this server.
-import { api, tideConfig, type VaultPolicy } from "./api";
+import { api, type VaultPolicy } from "./api";
+import { tideConfig } from "./tenant";
 import { unb64 } from "./crypto";
 import { signRelationshipPolicy, encryptForRecord, decryptForRecord } from "./tide/relationship";
 
@@ -21,7 +22,7 @@ export async function vaultPolicy(): Promise<VaultPolicy> {
 export async function signVaultPolicy(): Promise<void> {
   const { policy: adminPolicyB64 } = await api<{ policy: string }>("/api/admin-policy");
   const signed = await signRelationshipPolicy(
-    { vendorId: tideConfig.vendorId, subject: { type: "Role", id: VAULT_ROLE }, recordId: VAULT_RECORD_ID, access: "read-write" },
+    { vendorId: tideConfig().vendorId, subject: { type: "Role", id: VAULT_ROLE }, recordId: VAULT_RECORD_ID, access: "read-write" },
     unb64(adminPolicyB64),
   );
   await api("/api/vault/policy", { method: "PUT", body: JSON.stringify({ policy: signed, recordId: VAULT_RECORD_ID }) });

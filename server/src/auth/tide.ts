@@ -1,40 +1,38 @@
 // Token + DPoP verification for every API route. Based on the Tide pack's
-// nextjs-customer-portal src/lib/auth/tideJWT.ts, adapted to Express.
+// nextjs-customer-portal src/lib/auth/tideJWT.ts, adapted to Express and to many households:
+// the token's issuer says which household's realm it claims to come from, and it is then
+// verified against THAT realm's embedded key (each realm has its own key on the Tide network).
 import type { Request, Response, NextFunction } from "express";
-import { createLocalJWKSet, jwtVerify, type JWTPayload } from "jose";
-import { readFileSync } from "node:fs";
+import { createLocalJWKSet, decodeJwt, jwtVerify, type JWTPayload } from "jose";
 import { verifyDpop } from "./verifyDpop.ts";
-import { ADAPTER_PATH } from "../paths.ts";
+import { adapterOf, households, type Household } from "../households.ts";
 
-export interface TidecloakConfig {
-  realm: string;
-  "auth-server-url": string;
-  resource: string;
-  jwk: { keys: object[] };
-  vendorId?: string;
-}
+interface Adapter { realm: string; "auth-server-url": string; resource: string; jwk: { keys: object[] } }
 
-let _config: TidecloakConfig | null = null;
-let _jwks: ReturnType<typeof createLocalJWKSet> | null = null;
+const verifiers = new Map<string, { issuer: string; client: string; jwks: ReturnType<typeof createLocalJWKSet> }>();
 
-// Lazy: the adapter only exists once scripts/bootstrap.mjs has run.
-export function tideConfig(): TidecloakConfig {
-  if (!_config) {
-    const config = JSON.parse(readFileSync(ADAPTER_PATH, "utf8")) as TidecloakConfig;
-    if (!config.jwk) throw new Error("Adapter JSON missing jwk field. Re-export with IGA enabled.");
-    _config = config;
-    _jwks = createLocalJWKSet(config.jwk as Parameters<typeof createLocalJWKSet>[0]);
+function verifierFor(h: Household) {
+  if (!verifiers.has(h.id)) {
+    const a = adapterOf(h) as Adapter | null;
+    if (!a?.jwk) return null; // not provisioned yet
+    verifiers.set(h.id, {
+      issuer: `${a["auth-server-url"].replace(/\/+$/, "")}/realms/${a.realm}`,
+      client: a.resource,
+      jwks: createLocalJWKSet(a.jwk as Parameters<typeof createLocalJWKSet>[0]),
+    });
   }
-  return _config;
+  return verifiers.get(h.id)!;
 }
 
-export async function verifyTideJWT(token: string): Promise<JWTPayload> {
-  const config = tideConfig();
-  const { payload } = await jwtVerify(token, _jwks!, {
-    issuer: `${config["auth-server-url"].replace(/\/+$/, "")}/realms/${config.realm}`,
-  });
-  if (payload.azp !== config.resource) throw new Error("Token azp does not match client");
-  return payload;
+/** Find the household by the (still unverified) issuer, then verify against its own key. */
+export async function verifyTideJWT(token: string): Promise<{ claims: JWTPayload; household: Household }> {
+  const iss = decodeJwt(token).iss;
+  const household = households().find((h) => verifierFor(h)?.issuer === iss);
+  if (!household) throw new Error("Token is not from any known household");
+  const v = verifierFor(household)!;
+  const { payload } = await jwtVerify(token, v.jwks, { issuer: v.issuer });
+  if (payload.azp !== v.client) throw new Error("Token azp does not match client");
+  return { claims: payload, household };
 }
 
 export interface Caller {
@@ -46,7 +44,7 @@ export interface Caller {
 }
 
 declare module "express-serve-static-core" {
-  interface Request { caller?: Caller }
+  interface Request { caller?: Caller; household?: Household }
 }
 
 function toCaller(claims: JWTPayload): Caller {
@@ -72,20 +70,21 @@ function fetchLike(req: Request) {
   };
 }
 
-/** Verifies the JWT AND the DPoP proof. Never skips DPoP: every token this realm issues is bound. */
-export function requireAuth(check?: (c: Caller) => boolean, why = "Forbidden") {
+/** Verifies the JWT AND the DPoP proof. Never skips DPoP: every token these realms issue is bound. */
+export function requireAuth(check?: (c: Caller, h: Household) => boolean, why = "Forbidden") {
   return async (req: Request, res: Response, next: NextFunction) => {
     const authz = req.headers.authorization ?? "";
     if (!/^(Bearer|DPoP) /i.test(authz)) return res.status(401).json({ error: "Unauthorized" });
     const token = authz.replace(/^(Bearer|DPoP) /i, "");
     try {
-      const claims = await verifyTideJWT(token);
+      const { claims, household } = await verifyTideJWT(token);
       await verifyDpop(fetchLike(req), token, claims as { cnf?: { jkt?: string } });
       req.caller = toCaller(claims);
+      req.household = household;
     } catch (e) {
       return res.status(401).json({ error: "Invalid token", detail: e instanceof Error ? e.message : String(e) });
     }
-    if (check && !check(req.caller)) return res.status(403).json({ error: why });
+    if (check && !check(req.caller, req.household)) return res.status(403).json({ error: why });
     next();
   };
 }

@@ -116,6 +116,13 @@ Use one private browser window per character, all at <http://localhost:5173>.
 
 ---
 
+### Bonus: a second household signs up
+1. On the home page, click **Set up my household**. Enter a household name, your name and a username, then click **Create my household**.
+2. CamCo's server creates that household's **own realm**: its own keys on the Tide network, its own licence and its own quorum. This takes about 30 seconds.
+3. Click **Create my Tide account**. The page then finishes on its own: you become the owner, and CamCo is locked out.
+4. Click **Go to my household**, then **Create vault**. Add family with **Household members → Add a person → Get invite link**.
+5. Anyone signs in by entering the **household code** at **Sign in with Tide**.
+
 ## Repository layout
 ```
 scripts/   bootstrap.mjs (setup), cast.mjs (add/remove people later), realm.json.template

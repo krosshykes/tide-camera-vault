@@ -29,6 +29,7 @@ This document covers the architecture, every workflow (with diagrams), the secur
 18. [Troubleshooting](#18-troubleshooting)
 19. [Known limits and design trade-offs](#19-known-limits-and-design-trade-offs)
 20. [Glossary](#20-glossary)
+21. [Many households: sign-up and provisioning](#21-many-households-sign-up-and-provisioning)
 
 ---
 
@@ -418,6 +419,10 @@ Every route except `/api/health` verifies the **Tide JWT** (embedded JWKS, issue
 | Method | Path | Who | Purpose |
 |---|---|---|---|
 | GET | `/api/health` | anyone | liveness |
+| GET | `/api/households/:id` | anyone with the code | household name and status |
+| GET | `/api/households/:id/adapter` | anyone with the code | that realm's public sign-in config |
+| POST | `/api/signup` | anyone (3/hour/IP) | start provisioning a new household |
+| GET | `/api/signup/:token` | the person who signed up | provisioning progress + first owner's invite link |
 | GET | `/api/me` | signed in | username, roles, owner / household / vendor flags |
 | GET | `/api/vault/status` | signed in | has the vault been created, by whom |
 | GET | `/api/vault/policy` | household | the signed vault policy |
@@ -431,8 +436,11 @@ Every route except `/api/health` verifies the **Tide JWT** (embedded JWKS, issue
 | POST | `/api/household/request-viewer` | owner | **file** a `household-viewer` grant |
 | POST | `/api/household/revoke-viewer` | owner (not self) | **file** a `household-viewer` removal |
 | POST | `/api/household/request-owner` | owner | **file** a `tide-realm-admin` grant |
+| POST | `/api/household/invite` | owner | **file** CREATE_USER for a new person (no access) |
+| POST | `/api/household/invite-link` | owner | 12h Tide account link for someone not yet linked |
 | GET | `/api/audit` | household / vendor | recent events |
-| GET | `/api/vendor/records` | CamCo staff | raw DB rows |
+| GET | `/api/vendor/households` | CamCo staff | every household: realm, status, clip count |
+| GET | `/api/vendor/records?household=` | CamCo staff | raw DB rows |
 | GET | `/api/vendor/change-requests` | CamCo staff | pending requests as root sees them |
 | POST | `/api/vendor/self-grant` | CamCo staff | root tries to grant itself `household-viewer` |
 | POST | `/api/vendor/cr/:id/force` | CamCo staff | root tries `approve`, `authorize`, `commit` |
@@ -542,3 +550,57 @@ Problems met while building this, and their fixes.
 | **Wrapped key** | The clip's AES key, encrypted by the Tide network under the vault policy |
 | **DPoP** | Proof-of-possession: each API call is signed by a key bound to the token, so a stolen token can't be replayed |
 | **Root / master admin** | TideCloak's `admin` account in the `master` realm, held by CamCo |
+
+---
+
+## 21. Many households: sign-up and provisioning
+
+**One TideCloak realm per household.** TideCloak's quorum (IGA) is realm-wide. In one shared realm, every family's owners would approve everyone's changes, and the threshold would be 70% of *all* owners. A realm per household gives each family its own keys on the Tide network, its own owners and its own 2-of-3 quorum. The household from `npm run bootstrap` is registered as the first one, *The Demo Household* (`camera-vault`).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor M as New customer (Mai)
+  participant App as App: /signup
+  participant API as CamCo backend
+  participant TC as TideCloak
+  participant ORK as Tide network
+
+  M->>App: household name, her name, username (email optional)
+  App->>API: POST /api/signup
+  API-->>App: 202 + private sign-up token
+  Note over API,TC: Provisioning queue (one at a time), FirstAdmin mode:<br/>root can still approve its own setup
+  API->>TC: create realm hh-<name>-<id> from the template
+  API->>TC: disable profile page, setUpTideRealm (licence)
+  TC->>ORK: create the realm's keys
+  API->>TC: iga.attestor=tide, toggle IGA on
+  API->>TC: create owner "mai" + household-viewer, invite link
+  App->>API: GET /api/signup/:token (every 3 s)
+  API-->>App: awaiting-owner + invite link
+  M->>TC: "Create my Tide account" (new tab)
+  TC->>ORK: Mai's account (password never reaches CamCo)
+  API->>TC: sees tideUserKey: sign IdP settings, export adapter
+  API->>TC: grant tide-realm-admin to Mai LAST
+  Note over TC: Realm flips to multi-admin.<br/>From here CamCo can only FILE requests in it.
+  API-->>App: ready
+  M->>App: "Go to my household" → sign in → create vault → add family
+```
+
+**How the pieces find each other**
+
+| Piece | How it knows the household |
+|---|---|
+| Browser | The household code is stored locally (`camvault.household`). At start-up the app fetches that realm's adapter from `/api/households/:id/adapter`, then starts the Tide provider with it. Switching household reloads the page. |
+| Backend | Each request's token `iss` names a realm. The backend picks that household, then verifies the token against **that realm's** key, and uses that household's data folder (`server/data/households/<id>/`). |
+| DPoP relay page | Accepts the issuer + client of any registered household's realm, and answers 403 for anything else. |
+| CamCo staff | Sign in to CamCo's own realm (`camera-vault`). The Vendor Console lists every household and can target any of them. In a customer realm CamCo staff have no account, so root's "grant myself access" first has to file one: also a pending request for that household's owners. |
+
+**Adding people inside a household (owners, in-app).** **Add a person** files `CREATE_USER` → owners approve → the person appears with *no Tide account yet* → **Get invite link** (12 h) → the owner sends it privately → the person creates their own Tide account and starts with **no access** until the owners approve **Request viewing access**.
+
+**Restarts.** Households waiting for their owner (or finalizing) resume automatically when the backend starts. One caught mid-way through realm creation is marked *failed*; sign up again.
+
+**Still a prototype**
+- **Cameras can't encrypt on their own yet:** a signed-in browser does it. The next step is a device identity with an encrypt-only (write-only) policy, or a household hub such as the family's phone.
+- **Every realm is licensed under the operator's email** (`TIDE_LICENSE_EMAIL`), because the operator is the Tide licensee. Licence tiers and per-household pricing are for Tide to answer.
+- **Sign-up has only basic abuse control** (3 per IP per hour) and no email verification. Invite links are shown on screen instead of emailed.
+- **Branding is set once**, on the demo realm. Provisioned realms show Tide's default sign-in branding.

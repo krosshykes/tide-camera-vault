@@ -1,4 +1,6 @@
 // The signed-out home page: what this is, why it exists, how it works, and the way in.
+import { useState } from "react";
+import { fetchHousehold, selectHousehold, tenant, DEMO_HOUSEHOLD } from "./lib/tenant";
 
 const STEPS = [
   {
@@ -38,11 +40,17 @@ const CAST = [
 ];
 
 export function Home({ onSignIn }: { onSignIn: () => void }) {
+  const [picker, setPicker] = useState(false);
+  const open = () => setPicker(true);
   return (
     <div className="home">
+      {picker && <HouseholdPicker onSignIn={onSignIn} onClose={() => setPicker(false)} />}
       <header className="home-nav">
         <div className="brand"><span className="logo-dot" /> Home Camera Vault</div>
-        <button className="btn primary" onClick={onSignIn}>Sign in with Tide</button>
+        <div className="row">
+          <a className="btn ghost" href="/signup">Get started</a>
+          <button className="btn primary" onClick={open}>Sign in with Tide</button>
+        </div>
       </header>
 
       <section className="hero">
@@ -55,7 +63,8 @@ export function Home({ onSignIn }: { onSignIn: () => void }) {
             root on its own servers.
           </p>
           <div className="row">
-            <button className="btn primary big" onClick={onSignIn}>Sign in with Tide</button>
+            <button className="btn primary big" onClick={open}>Sign in with Tide</button>
+            <a className="btn ghost big" href="/signup">Set up my household</a>
             <a className="btn ghost big" href="#how">How it works</a>
           </div>
         </div>
@@ -122,13 +131,56 @@ export function Home({ onSignIn }: { onSignIn: () => void }) {
       <section className="home-section cta">
         <h2>See it for yourself</h2>
         <p>Sign in as a household owner to record and play encrypted clips, or as CamCo Support to try, and fail, to get in.</p>
-        <button className="btn primary big" onClick={onSignIn}>Sign in with Tide</button>
+        <button className="btn primary big" onClick={open}>Sign in with Tide</button>
       </section>
 
       <footer className="home-footer">
         <span>Prototype for the RMIT × Tide UNLOCKED hackathon. Cameras and footage are synthetic.</span>
         <span>Secured with <b>TideCloak</b>: no master key, quorum-approved access.</span>
       </footer>
+    </div>
+  );
+}
+
+/** Which household to sign in to. Each household is its own realm, so a change means a reload. */
+function HouseholdPicker({ onSignIn, onClose }: { onSignIn: () => void; onClose: () => void }) {
+  const current = tenant().info;
+  const [code, setCode] = useState(current.id);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function go(id: string) {
+    setErr(""); setBusy(true);
+    try {
+      if (id === current.id) { onSignIn(); return; }
+      const h = await fetchHousehold(id.trim());
+      if (h.status !== "ready") throw new Error(`"${h.name}" is still being set up (${h.status}).`);
+      selectHousehold(h.id);
+      window.location.assign("/?login=1"); // reload with that household's Tide config, then sign in
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="card modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Choose household">
+        <h2>Sign in to your household</h2>
+        <p className="muted small">Each household is separate, with its own keys and its own owners. Enter the household code you were given.</p>
+        <form onSubmit={(e) => { e.preventDefault(); void go(code); }}>
+          <label className="small">Household code
+            <input value={code} onChange={(e) => setCode(e.target.value)} autoFocus />
+          </label>
+          <div className="row">
+            <button className="btn primary" disabled={busy || !code.trim()}>{code.trim() === current.id ? `Sign in to ${current.name}` : "Continue"}</button>
+            {current.id !== DEMO_HOUSEHOLD && <button type="button" className="btn ghost" disabled={busy} onClick={() => go(DEMO_HOUSEHOLD)}>Demo household</button>}
+            <button type="button" className="btn ghost" onClick={onClose}>Cancel</button>
+          </div>
+        </form>
+        {err && <p className="small warn-text">{err}</p>}
+        <p className="muted tiny">New here? <a href="/signup">Set up a household</a>.</p>
+      </div>
     </div>
   );
 }

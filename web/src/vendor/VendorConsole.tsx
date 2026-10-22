@@ -6,12 +6,20 @@ import { tally, type ChangeRequest } from "../lib/iga";
 import { Steps, useSteps, ErrorBox, short, kb, when } from "../components";
 
 interface Records { clips: Clip[]; vaultPolicy: VaultPolicy | null }
+interface HouseholdRow { id: string; name: string; status: string; realm: string; clips: number; vault: boolean }
 
 export function VendorConsole({ me }: { me: Me }) {
   const [records, setRecords] = useState<Records | null>(null);
   const [err, setErr] = useState("");
-  const load = useCallback(() => api<Records>("/api/vendor/records").then(setRecords).catch((e) => setErr(String(e.message ?? e))), []);
-  useEffect(() => { void load(); }, [load]);
+  const [list, setList] = useState<HouseholdRow[]>([]);
+  const [target, setTarget] = useState(me.household.id);
+  const load = useCallback(() => {
+    setErr("");
+    api<HouseholdRow[]>("/api/vendor/households").then(setList).catch(() => {});
+    api<Records>(`/api/vendor/records?household=${encodeURIComponent(target)}`).then(setRecords).catch((e) => setErr(String(e.message ?? e)));
+  }, [target]);
+  useEffect(() => { setRecords(null); void load(); }, [load]);
+  const current = list.find((h) => h.id === target);
 
   return (
     <div className="grid">
@@ -20,8 +28,29 @@ export function VendorConsole({ me }: { me: Me }) {
         <p>You can read every row in the database and you hold TideCloak's root admin password. What you can't do is watch a household's footage or give yourself the right to.</p>
       </section>
       <section className="card span-all">
+        <h2>Customers</h2>
+        <p className="muted small">Every household is its own TideCloak realm, with its own keys on the Tide network and its own owners. CamCo holds root on all of them.</p>
+        <div className="table-wrap">
+          <table className="raw">
+            <thead><tr><th>household</th><th>realm</th><th>status</th><th>clips</th><th>vault</th><th /></tr></thead>
+            <tbody>
+              {list.map((h) => (
+                <tr key={h.id} className={h.id === target ? "selected-row" : ""}>
+                  <td>{h.name}<div className="muted tiny mono">{h.id}</div></td>
+                  <td className="mono tiny">{h.realm}</td>
+                  <td>{h.status}</td>
+                  <td>{h.clips}</td>
+                  <td>{h.vault ? "✓" : "—"}</td>
+                  <td><button className="btn ghost" disabled={h.id === target} onClick={() => setTarget(h.id)}>{h.id === target ? "Inspecting" : "Inspect"}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className="card span-all">
         <div className="row spread">
-          <h2>Raw storage: <code>clips</code> table</h2>
+          <h2>Raw storage: <code>clips</code> table{current ? ` · ${current.name}` : ""}</h2>
           <button className="btn ghost" onClick={load}>Refresh</button>
         </div>
         {err && <ErrorBox title="Could not load records" detail={err} />}
@@ -40,7 +69,7 @@ export function VendorConsole({ me }: { me: Me }) {
         )}
         <p className="muted tiny">Metadata (camera, time, size) is visible to CamCo. The footage and its keys are not.</p>
       </section>
-      <SelfGrant me={me} />
+      <SelfGrant me={me} target={target} targetName={current?.name ?? target} key={target} />
     </div>
   );
 }
@@ -97,25 +126,26 @@ function ClipRow({ clip, policy }: { clip: Clip; policy: VaultPolicy | null }) {
 interface GrantReply { results: { role: string; status: number; changeRequestId?: string; note?: string }[]; changeRequests: ChangeRequest[] }
 interface ForceReply { attempts: { lane: string; status: number; body: unknown }[]; changeRequest: ChangeRequest }
 
-function SelfGrant({ me }: { me: Me }) {
+function SelfGrant({ me, target, targetName }: { me: Me; target: string; targetName: string }) {
+  const q = `household=${encodeURIComponent(target)}`;
   const [grant, setGrant] = useState<GrantReply | null>(null);
   const [force, setForce] = useState<ForceReply | null>(null);
   const [pending, setPending] = useState<ChangeRequest[]>([]);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const loadPending = useCallback(() => api<ChangeRequest[]>("/api/vendor/change-requests").then(setPending).catch(() => {}), []);
+  const loadPending = useCallback(() => api<ChangeRequest[]>(`/api/vendor/change-requests?${q}`).then(setPending).catch(() => {}), [q]);
   useEffect(() => { void loadPending(); const t = setInterval(loadPending, 5000); return () => clearInterval(t); }, [loadPending]);
 
   async function selfGrant() {
     setBusy(true); setErr(""); setForce(null);
-    try { setGrant(await api<GrantReply>("/api/vendor/self-grant", { method: "POST" })); await loadPending(); }
+    try { setGrant(await api<GrantReply>(`/api/vendor/self-grant?${q}`, { method: "POST" })); await loadPending(); }
     catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   }
   async function forceApprove(id: string) {
     setBusy(true); setErr("");
-    try { setForce(await api<ForceReply>(`/api/vendor/cr/${id}/force`, { method: "POST" })); await loadPending(); }
+    try { setForce(await api<ForceReply>(`/api/vendor/cr/${id}/force?${q}`, { method: "POST" })); await loadPending(); }
     catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   }
@@ -130,9 +160,9 @@ function SelfGrant({ me }: { me: Me }) {
 
   return (
     <section className="card span-all">
-      <h2>Escalate: grant myself viewing access</h2>
-      <p className="muted small">Uses TideCloak's <b>master admin</b> (root) to give <code>{me.username}</code> the role <code>household-viewer</code>, which carries the decrypt capability <code>_tide_decryptor</code>. On an ordinary system this is one click and you'd be in.</p>
-      <button className="btn danger big" disabled={busy} onClick={selfGrant}>Grant myself access (as root)</button>
+      <h2>Escalate: grant myself viewing access to {targetName}</h2>
+      <p className="muted small">Uses TideCloak's <b>master admin</b> (root) to give <code>{me.username}</code> the role <code>household-viewer</code>, which carries the decrypt capability <code>_tide_decryptor</code>. In a customer's realm CamCo staff don't even have an account, so root first has to file one. On an ordinary system this is one click and you'd be in.</p>
+      <button className="btn danger big" disabled={busy} onClick={selfGrant}>Grant myself access to {targetName} (as root)</button>
       {err && <ErrorBox title="Request failed" detail={err} />}
       {grant && (
         <div className="result">

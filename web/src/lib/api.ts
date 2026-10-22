@@ -1,7 +1,7 @@
 // Calls to our backend and to TideCloak, always through IAMService.secureFetch so the
 // DPoP-bound token goes out with its proof. Never set Authorization yourself.
 import { IAMService } from "@tidecloak/js";
-import tcConfig from "../../public/tidecloak.json";
+import { tideConfig } from "./tenant";
 
 export class ApiError extends Error {
   constructor(public status: number, message: string, public body: unknown) { super(message); }
@@ -24,10 +24,9 @@ async function call<T>(url: string, init: RequestInit = {}): Promise<T> {
 export const api = <T>(path: string, init?: RequestInit) => call<T>(new URL(path, window.location.origin).toString(), init);
 
 // Browser -> TideCloak admin API, with the signed-in owner's own token (AP-89: never proxied).
-const tcAdminBase = `${String(tcConfig["auth-server-url"]).replace(/\/+$/, "")}/admin/realms/${tcConfig.realm}`;
-export const tcAdmin = <T>(path: string, init?: RequestInit) => call<T>(`${tcAdminBase}${path}`, init);
-
-export const tideConfig = tcConfig as unknown as { realm: string; resource: string; vendorId: string; "auth-server-url": string };
+// The base depends on which household (realm) this page loaded.
+const tcAdminBase = () => `${String(tideConfig()["auth-server-url"]).replace(/\/+$/, "")}/admin/realms/${tideConfig().realm}`;
+export const tcAdmin = <T>(path: string, init?: RequestInit) => call<T>(`${tcAdminBase()}${path}`, init);
 
 export interface Me {
   username: string;
@@ -36,6 +35,7 @@ export interface Me {
   isHousehold: boolean;
   isVendor: boolean;
   canDecrypt: boolean;
+  household: { id: string; name: string; status: string };
 }
 
 export interface ClipMeta {

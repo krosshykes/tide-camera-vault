@@ -495,6 +495,27 @@ function Members({ me }: { me: Me }) {
 
   const name = (u: string) => u.charAt(0).toUpperCase() + u.slice(1);
 
+  // Adding a person files CREATE_USER. Once owners approve it they appear in the list without a
+  // Tide account, and an owner fetches their invite link to send them.
+  const [invite, setInvite] = useState({ username: "", name: "" });
+  const [link, setLink] = useState<{ username: string; link: string } | null>(null);
+  async function addPerson(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const r = await api<{ status: number }>("/api/household/invite", { method: "POST", body: JSON.stringify(invite) });
+      setOut(`Add ${invite.name || invite.username}: HTTP ${r.status}, waiting for owner approval. Once it's approved, fetch their invite link here.`);
+      setInvite({ username: "", name: "" });
+    } catch (e) { setOut(`Add person failed: ${e instanceof Error ? e.message : e}`); }
+    finally { setBusy(false); void load(); }
+  }
+  async function getLink(username: string) {
+    setBusy(true);
+    try { setLink({ username, link: (await api<{ link: string }>("/api/household/invite-link", { method: "POST", body: JSON.stringify({ username }) })).link }); }
+    catch (e) { setOut(`Invite link failed: ${e instanceof Error ? e.message : e}`); }
+    finally { setBusy(false); }
+  }
+
   return (
     <section className="card">
       <h2>Household members</h2>
@@ -518,6 +539,7 @@ function Members({ me }: { me: Me }) {
                 </td>
                 <td>
                   <div className="row">
+                    {!m.linked && <button className="btn primary" disabled={busy} onClick={() => getLink(m.username)}>Get invite link</button>}
                     {!m.viewer && <button className="btn" disabled={busy || pending} onClick={() => request("/api/household/request-viewer", m.username, `Give ${name(m.username)} access`)}>Request viewing access</button>}
                     {/* No self-removal: the server refuses it too (403); this just doesn't offer it. */}
                     {m.viewer && m.username !== me.username && <button className="btn danger" disabled={busy || pending} onClick={() => request("/api/household/revoke-viewer", m.username, `Remove ${name(m.username)}'s access`)}>Remove access</button>}
@@ -530,7 +552,24 @@ function Members({ me }: { me: Me }) {
           })}
         </tbody>
       </table>
-      <p className="muted tiny">Removal takes effect at that person's next sign-in, or within about 10 minutes when their login refreshes. Anything they already saved from the screen can't be clawed back.</p>
+      {link && (
+        <div className="invite-link">
+          <b className="small">Invite link for {name(link.username)} (valid 12 hours)</b>
+          <code>{link.link}</code>
+          <div className="row">
+            <button className="btn" onClick={() => void navigator.clipboard?.writeText(link.link)}>Copy</button>
+            <button className="btn ghost" onClick={() => setLink(null)}>Done</button>
+          </div>
+          <span className="muted tiny">Send it to them privately. They open it and create their own Tide account; nobody else ever sees their password.</span>
+        </div>
+      )}
+      <form className="invite-form" onSubmit={addPerson}>
+        <input placeholder="Name, e.g. Jordan" value={invite.name} onChange={(e) => setInvite({ ...invite, name: e.target.value })} />
+        <input required placeholder="username, e.g. jordan" pattern="[a-z][a-z0-9._\-]{1,29}" title="2-30 characters: letters, numbers, . _ -"
+          value={invite.username} onChange={(e) => setInvite({ ...invite, username: e.target.value.toLowerCase() })} />
+        <button className="btn" disabled={busy}>Add a person</button>
+      </form>
+      <p className="muted tiny">New people start with no access. Removal takes effect at that person's next sign-in, or within about 10 minutes when their login refreshes. Anything they already saved from the screen can't be clawed back.</p>
       {out && <p className="small">{out}</p>}
     </section>
   );
