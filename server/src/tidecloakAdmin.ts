@@ -118,6 +118,51 @@ export async function fileRealmRoleGrant(username: string, roles: string[]) {
   return { results, changeRequests };
 }
 
+/** Files (does not apply) a realm-role removal. Same rules as grants: one role per call. */
+export async function fileRealmRoleRevoke(username: string, roles: string[]) {
+  const userId = realmState().userIds[username];
+  if (!userId) throw new Error(`unknown user ${username}`);
+  const held = new Set(((await rootCall("GET", `/users/${userId}/role-mappings/realm`)).body as { name: string }[] ?? []).map((r) => r.name));
+  const results: { role: string; status: number; changeRequestId?: string; note?: string }[] = [];
+  for (const rep of await realmRoles(roles)) {
+    if (!held.has(rep.name!)) { results.push({ role: rep.name!, status: 0, note: "not held" }); continue; }
+    const before = new Set((await listChangeRequests()).map((c) => c.id));
+    const r = await rootCall("DELETE", `/users/${userId}/role-mappings/realm`, [rep]);
+    const fresh = (await listChangeRequests()).find((c) => !before.has(c.id) && c.entityId === userId);
+    const conflict = (r.body as { conflictingChangeRequestId?: string })?.conflictingChangeRequestId;
+    results.push({
+      role: rep.name!, status: r.status,
+      changeRequestId: (r.body as { changeRequestId?: string })?.changeRequestId ?? fresh?.id ?? conflict,
+      note: r.status === 409 ? "blocked: a change for this user is already pending" : undefined,
+    });
+  }
+  const ids = new Set(results.map((r) => r.changeRequestId).filter(Boolean));
+  const changeRequests = (await listChangeRequests()).filter((c) => ids.has(c.id));
+  return { results, changeRequests };
+}
+
+/** Everyone in the realm, as TideCloak sees them right now (not as any token claims). */
+export async function members(vendorStaff: string[]) {
+  const { userIds, realmManagementClient } = realmState();
+  const pending = await listChangeRequests();
+  const out = [];
+  for (const [username, id] of Object.entries(userIds)) {
+    if (vendorStaff.includes(username)) continue;
+    const user = (await rootCall("GET", `/users/${id}`)).body as { attributes?: Record<string, string[]> } | null;
+    if (!user || typeof user !== "object" || !("attributes" in user || "username" in user)) continue; // deleted
+    const realm = ((await rootCall("GET", `/users/${id}/role-mappings/realm`)).body as { name: string }[]) ?? [];
+    const client = ((await rootCall("GET", `/users/${id}/role-mappings/clients/${realmManagementClient}`)).body as { name: string }[]) ?? [];
+    out.push({
+      username,
+      linked: !!user.attributes?.tideUserKey?.[0],
+      viewer: Array.isArray(realm) && realm.some((r) => r.name === "household-viewer"),
+      owner: Array.isArray(client) && client.some((r) => r.name === "tide-realm-admin"),
+      pending: pending.filter((c) => c.entityId === id).map((c) => c.actionType),
+    });
+  }
+  return out;
+}
+
 export async function roleNames(): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const r of ((await rootCall("GET", "/roles?max=200")).body as { id: string; name: string }[]) ?? []) out[r.id] = r.name;

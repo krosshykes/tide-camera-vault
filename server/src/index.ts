@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { requireAuth, isHousehold, isOwner, type Caller } from "./auth/tide.ts";
 import { db, save, audit, type Clip } from "./db.ts";
 import {
-  rootCall, listChangeRequests, fileRealmRoleGrant, fileOwnerGrant, adminPolicy, realmState, roleNames, REALM,
+  rootCall, listChangeRequests, fileRealmRoleGrant, fileRealmRoleRevoke, members, fileOwnerGrant, adminPolicy, realmState, roleNames, REALM,
 } from "./tidecloakAdmin.ts";
 
 const VENDOR_STAFF = (process.env.VENDOR_STAFF || "camco-support").split(",").map((s) => s.trim());
@@ -123,6 +123,28 @@ app.post("/api/household/request-owner", requireAuth(isOwner, "Only owners can p
   audit(req.caller!.username, "household.request-owner", `${username}: tide-realm-admin=${out.results[0].status}`);
   save();
   res.json(out);
+}));
+
+// Someone leaves: an owner files the removal. Like a grant, it only applies once enough owners
+// approve it in the Tide enclave. The vault policy names the role, so taking the role away cuts
+// off every clip, old and new, with no re-encryption.
+app.post("/api/household/revoke-viewer", requireAuth(isOwner, "Only owners can remove members"), wrap(async (req, res) => {
+  const username = String(req.body?.username ?? "");
+  // Checked against the verified token, not anything the browser claims: an owner can't file
+  // their own removal. Another owner has to propose it.
+  if (username === req.caller!.username) {
+    audit(req.caller!.username, "household.revoke-viewer.refused", `${username} tried to remove their own access`);
+    save();
+    return res.status(403).json({ error: "You can't remove your own access. Another owner has to request it." });
+  }
+  const out = await fileRealmRoleRevoke(username, VIEW_ROLES);
+  audit(req.caller!.username, "household.revoke-viewer", `${username}: ${out.results.map((r) => `${r.role}=${r.status || r.note}`).join(", ")}`);
+  save();
+  res.json(out);
+}));
+
+app.get("/api/household/members", requireAuth(isOwner, "Owners only"), wrap(async (_req, res) => {
+  res.json(await members(VENDOR_STAFF));
 }));
 
 app.get("/api/audit", requireAuth((c) => isHousehold(c) || isVendor(c)), (_req, res) => { res.json(db().audit.slice(0, 50)); });

@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, type ClipMeta, type Clip, type Me } from "../lib/api";
 import { encryptClip, decryptClip } from "../lib/crypto";
 import { vaultPolicy, signVaultPolicy, wrapKey, unwrapKey, explainTideError, VAULT_ROLE } from "../lib/vault";
 import { listPending, approveChangeRequest, denyChangeRequest, describe, tally, type ChangeRequest, type Directory } from "../lib/iga";
 import { SCENES, snapshot, recordClip, type Scene } from "../camera/scenes";
+import { listCameras, openCamera, liveSnapshot, liveClip } from "../camera/live";
+import { watchMotion, thresholdFor, type MotionState } from "../camera/motion";
 import { Steps, useSteps, Media, ErrorBox, kb, when } from "../components";
 
 export function Household({ me }: { me: Me }) {
@@ -26,7 +28,7 @@ export function Household({ me }: { me: Me }) {
       {me.isHousehold && vault?.hasPolicy && <CameraSimulator onUploaded={refreshClips} />}
       {me.isHousehold && <Gallery clips={clips} error={clipsError} />}
       {me.isOwner && <Approvals me={me} />}
-      {me.isOwner && <Members />}
+      {me.isOwner && <Members me={me} />}
       {vault?.hasPolicy && (
         <p className="muted small span-all">
           Vault policy <code>RelationshipAttestation:1</code> (subject: role <code>{VAULT_ROLE}</code>) signed by {vault.signedBy} in the Tide enclave.
@@ -74,22 +76,32 @@ function VaultSetup({ onDone }: { onDone: () => void }) {
   );
 }
 
+interface Source {
+  camera: string;
+  label: string;
+  live: boolean;
+  first?: string; // overrides the first step label (motion clips are already recorded)
+  produce: (video: boolean) => Promise<{ bytes: Uint8Array; mime: string }>;
+}
+
 function CameraSimulator({ onUploaded }: { onUploaded: () => void }) {
   const { steps, run } = useSteps();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<{ title: string; detail?: string } | null>(null);
   const [preview, setPreview] = useState<{ bytes: Uint8Array; mime: string } | null>(null);
 
-  async function capture(scene: Scene, video: boolean) {
+  // One pipeline for every source: the synthetic scenes and a real camera are treated identically.
+  async function capture(src: Source, video: boolean) {
     setBusy(true); setErr(null); setPreview(null);
+    const what = src.live ? "real camera" : "synthetic feed";
     try {
       await run([
-        video ? "Camera records a 3-second clip (synthetic feed)" : "Camera takes a snapshot (synthetic feed)",
+        src.first ?? (video ? `Camera records a 3-second clip (${what})` : `Camera takes a snapshot (${what})`),
         "Encrypt it in this browser with a fresh AES-256-GCM key",
         "Tide network wraps the AES key under the household vault policy",
         "Upload ciphertext + wrapped key to CamCo cloud",
       ], async (step) => {
-        const media = video ? await recordClip(scene) : await snapshot(scene);
+        const media = await src.produce(video);
         setPreview(media);
         step(0, `${kb(media.bytes.length)} ${media.mime}, plaintext stays on this device`);
         const enc = await encryptClip(media.bytes);
@@ -98,7 +110,7 @@ function CameraSimulator({ onUploaded }: { onUploaded: () => void }) {
         const wrappedKey = await wrapKey(enc.rawKey, policy);
         step(2, "no one, including CamCo, holds a key that can unwrap it");
         await api("/api/clips", { method: "POST", body: JSON.stringify({
-          camera: scene.camera, label: scene.label, mime: media.mime, iv: enc.iv, ciphertext: enc.ciphertext, wrappedKey, capturedAt: Date.now(),
+          camera: src.camera, label: src.label, mime: media.mime, iv: enc.iv, ciphertext: enc.ciphertext, wrappedKey, capturedAt: Date.now(),
         }) });
         step(3, "server stored: ciphertext only");
       });
@@ -109,25 +121,215 @@ function CameraSimulator({ onUploaded }: { onUploaded: () => void }) {
     } finally { setBusy(false); }
   }
 
+  const sceneSource = (sc: Scene): Source => ({ camera: sc.camera, label: sc.label, live: false, produce: (v) => (v ? recordClip(sc) : snapshot(sc)) });
+
   return (
     <section className="card">
-      <h2>Camera simulator</h2>
-      <p className="muted small">Synthetic cameras. Pressing a button creates a motion event, encrypted on this device before upload.</p>
+      <h2>Cameras</h2>
+      <LiveCamera busy={busy} onCapture={capture} />
+      {/* Progress sits right under the cameras, so a capture visibly does something. */}
+      <Steps steps={steps} />
+      {err && <ErrorBox {...err} />}
+      {preview && <div className="preview"><span className="tag">camera view, before encryption (never uploaded)</span><Media {...preview} /></div>}
+      <p className="muted small">Synthetic cameras. Each button creates a motion event, encrypted on this device before upload.</p>
       <div className="scene-list">
-        {SCENES.map((s) => (
-          <div className="scene" key={s.id}>
-            <div><b>{s.camera}</b><div className="muted small">{s.label}</div></div>
+        {SCENES.map((sc) => (
+          <div className="scene" key={sc.id}>
+            <div><b>{sc.camera}</b><div className="muted small">{sc.label}</div></div>
             <div className="row">
-              <button className="btn" disabled={busy} onClick={() => capture(s, false)}>Snapshot</button>
-              <button className="btn" disabled={busy} onClick={() => capture(s, true)}>3s clip</button>
+              <button className="btn" disabled={busy} onClick={() => capture(sceneSource(sc), false)}>Snapshot</button>
+              <button className="btn" disabled={busy} onClick={() => capture(sceneSource(sc), true)}>3s clip</button>
             </div>
           </div>
         ))}
       </div>
-      <Steps steps={steps} />
-      {preview && <div className="preview"><span className="tag">camera view, before encryption (never uploaded)</span><Media {...preview} /></div>}
-      {err && <ErrorBox {...err} />}
     </section>
+  );
+}
+
+/** Optional real camera: the DroidCam virtual webcam, a laptop webcam, any videoinput device. */
+function LiveCamera({ busy, onCapture }: { busy: boolean; onCapture: (src: Source, video: boolean) => Promise<void> }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const [on, setOn] = useState(false);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [deviceId, setDeviceId] = useState("");
+  const [status, setStatus] = useState("");
+  const [err, setErr] = useState("");
+  const [gen, setGen] = useState(0); // bumps on every new stream so the attach effect re-runs
+
+  const stopTracks = () => { streamRef.current?.getTracks().forEach((t) => t.stop()); streamRef.current = null; };
+  useEffect(() => stopTracks, []);
+
+  // Attach the stream once the <video> exists, start playback explicitly, then confirm frames arrive.
+  useEffect(() => {
+    const el = videoRef.current;
+    const s = streamRef.current;
+    if (!on || !el || !s) return;
+    el.srcObject = s;
+    el.play().catch((e) => setErr(`Video playback failed: ${e instanceof Error ? e.message : e}`));
+    setStatus("waiting for picture…");
+    const t = setTimeout(() => {
+      const track = s.getVideoTracks()[0];
+      if (el.videoWidth > 0) setStatus(`receiving frames ${el.videoWidth}×${el.videoHeight} from "${track?.label ?? "camera"}"`);
+      else setStatus(`no picture from "${track?.label ?? "camera"}" (track ${track?.readyState ?? "?"}${track?.muted ? ", muted" : ""}). Is the DroidCam client connected and showing the phone's video?`);
+    }, 2000);
+    return () => clearTimeout(t);
+  }, [on, gen]);
+
+  async function start(id?: string) {
+    setErr(""); setStatus("opening camera…");
+    try {
+      stopTracks();
+      let s = await openCamera(id);
+      // Labels are only readable after permission is granted. Prefer DroidCam when it is there.
+      const cams = await listCameras();
+      setDevices(cams);
+      let active = s.getVideoTracks()[0]?.getSettings().deviceId ?? "";
+      const droid = cams.find((d) => /droidcam/i.test(d.label));
+      if (!id && droid && droid.deviceId !== active) {
+        s.getTracks().forEach((t) => t.stop());
+        s = await openCamera(droid.deviceId);
+        active = droid.deviceId;
+      }
+      streamRef.current = s;
+      setDeviceId(active);
+      setOn(true);
+      setGen((g) => g + 1);
+    } catch (e) {
+      setOn(false); setStatus("");
+      setErr(e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+    }
+  }
+  function stop() { stopTracks(); setOn(false); setStatus(""); }
+
+  const label = devices.find((d) => d.deviceId === deviceId)?.label || "Live camera";
+  const name = /droidcam/i.test(label) ? "Phone cam" : "Live cam";
+  const src: Source = {
+    camera: name, label: "Live capture", live: true,
+    produce: async (v) => {
+      const el = videoRef.current;
+      if (!el || !streamRef.current) throw new Error("Start the camera first.");
+      if (el.videoWidth === 0) throw new Error(`The camera "${label}" is not sending a picture yet, so there is nothing to capture.`);
+      return v ? liveClip(el, name) : liveSnapshot(el, name);
+    },
+  };
+
+  return (
+    <div className="live-cam">
+      <div className="row spread">
+        <div><b>Live camera</b> <span className="muted small">(optional: DroidCam or a webcam)</span></div>
+        {!on
+          ? <button className="btn" onClick={() => start()}>Start camera</button>
+          : <button className="btn ghost" onClick={stop}>Stop</button>}
+      </div>
+      {on && (
+        <>
+          <label className="muted tiny">Camera:{" "}
+            <select className="select" value={deviceId} onChange={(e) => void start(e.target.value)}>
+              {devices.map((d, i) => <option key={d.deviceId || i} value={d.deviceId}>{d.label || `camera ${i + 1}`}</option>)}
+            </select>
+          </label>
+          <video ref={videoRef} className="media live-preview" autoPlay muted playsInline />
+          {status && <div className="muted tiny">{status}</div>}
+          <div className="row">
+            <button className="btn primary" disabled={busy} onClick={() => void onCapture(src, false)}>Snapshot</button>
+            <button className="btn primary" disabled={busy} onClick={() => void onCapture(src, true)}>Record 3s</button>
+            <span className="muted tiny">Point it at something non-personal (a desk, a toy). Never film people for the demo.</span>
+          </div>
+          <MotionPanel videoRef={videoRef} camera={name} onCapture={onCapture} />
+        </>
+      )}
+      {err && (
+        <ErrorBox
+          title="Could not open the camera"
+          detail={`${err}\n\nAllow camera access for localhost:5173. For DroidCam: start the DroidCam client on Windows and connect it to the phone first, then choose "DroidCam Source" here.`}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Arm/disarm motion-triggered recording on the live feed. Clips upload one at a time. */
+function MotionPanel({ videoRef, camera, onCapture }: {
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  camera: string;
+  onCapture: (src: Source, video: boolean) => Promise<void>;
+}) {
+  const [armed, setArmed] = useState(false);
+  const [sensitivity, setSensitivity] = useState(60);
+  const sensRef = useRef(sensitivity);
+  sensRef.current = sensitivity;
+  const [meter, setMeter] = useState({ level: 0, threshold: thresholdFor(60) });
+  const [state, setState] = useState<{ s: MotionState; ms?: number }>({ s: "watching" });
+  const [count, setCount] = useState(0);
+  const [queued, setQueued] = useState(0);
+  const [err, setErr] = useState("");
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  // The parent re-creates onCapture on every render; keep the latest in a ref so the watcher is
+  // only re-armed when the user toggles it, not on every progress update.
+  const captureRef = useRef(onCapture);
+  captureRef.current = onCapture;
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!armed || !el) return;
+    setErr("");
+    const w = watchMotion(el, camera, () => sensRef.current, {
+      onLevel: (level, threshold) => setMeter({ level, threshold }),
+      onState: (s, ms) => setState({ s, ms }),
+      onError: (e) => setErr(e instanceof Error ? e.message : String(e)),
+      onClip: (media, seconds) => {
+        setCount((n) => n + 1);
+        setQueued((n) => n + 1);
+        const src: Source = {
+          camera, label: `Motion detected (${seconds}s)`, live: true,
+          first: `Motion detected: camera recorded ${seconds}s automatically`,
+          produce: async () => media,
+        };
+        // Serialise uploads so overlapping events don't trample each other's progress.
+        queue.current = queue.current.then(() => captureRef.current(src, true)).finally(() => setQueued((n) => n - 1));
+      },
+    });
+    return () => w.stop();
+  }, [armed, camera, videoRef]);
+
+  const pct = Math.min(100, (meter.level / Math.max(meter.threshold * 2, 0.01)) * 100);
+  const mark = 50; // the threshold sits at the middle of the bar
+  const label = !armed ? "Disarmed"
+    : state.s === "warming" ? "Warming up…"
+    : state.s === "recording" ? `● Recording ${((state.ms ?? 0) / 1000).toFixed(1)}s`
+    : state.s === "cooldown" ? "Saving clip…"
+    : "Watching for motion";
+
+  return (
+    <div className="motion">
+      <div className="row spread">
+        <label className="row small">
+          <input type="checkbox" checked={armed} onChange={(e) => setArmed(e.target.checked)} />
+          <b>Motion detection</b>
+        </label>
+        <span className={`motion-state ${armed ? state.s : "off"}`}>{label}</span>
+      </div>
+      {armed && (
+        <>
+          <div className="meter" title={`motion ${(meter.level * 100).toFixed(1)}% of pixels, trigger at ${(meter.threshold * 100).toFixed(1)}%`}>
+            <div className={`meter-fill ${meter.level >= meter.threshold ? "hot" : ""}`} style={{ width: `${pct}%` }} />
+            <div className="meter-mark" style={{ left: `${mark}%` }} />
+          </div>
+          <label className="row tiny muted">
+            Sensitivity
+            <input type="range" min={1} max={100} value={sensitivity} onChange={(e) => setSensitivity(Number(e.target.value))} />
+            {sensitivity}
+          </label>
+          <div className="muted tiny">
+            Starts recording on motion, stops after 2s of stillness (max 15s). Each clip is encrypted on this device before upload.
+            {count > 0 && ` ${count} motion event${count > 1 ? "s" : ""} recorded${queued > 0 ? `, ${queued} uploading` : ""}.`}
+          </div>
+        </>
+      )}
+      {err && <ErrorBox title="Motion detection error" detail={err} />}
+    </div>
   );
 }
 
@@ -259,33 +461,76 @@ function Approvals({ me }: { me: Me }) {
   );
 }
 
-function Members() {
-  const [out, setOut] = useState<string>("");
+interface Member { username: string; linked: boolean; viewer: boolean; owner: boolean; pending: string[] }
+
+const PENDING_TEXT: Record<string, string> = {
+  GRANT_ROLES: "grant pending approval",
+  REVOKE_ROLES: "removal pending approval",
+  DELETE_USER: "deletion pending approval",
+  CREATE_USER: "creation pending approval",
+};
+
+/** Who can see the cameras right now, as TideCloak records it, with the actions owners can file. */
+function Members({ me }: { me: Me }) {
+  const [list, setList] = useState<Member[] | null>(null);
+  const [out, setOut] = useState("");
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    try { setList(await api<Member[]>("/api/household/members")); setErr(""); }
+    catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+  }, []);
+  useEffect(() => { void load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
+
   async function request(path: string, username: string, what: string) {
+    if (path.endsWith("revoke-viewer") && !window.confirm(`File a request to remove ${username}'s access to the cameras? It applies only once enough owners approve it.`)) return;
     setBusy(true);
     try {
       const r = await api<{ results: { role: string; status: number; note?: string }[] }>(path, { method: "POST", body: JSON.stringify({ username }) });
-      setOut(`${what}: ${r.results.map((x) => `${x.role} → ${`HTTP ${x.status}${x.note ? `: ${x.note}` : " (waiting for owner approval)"}`}`).join("; ")}.`);
+      setOut(`${what}: ${r.results.map((x) => `${x.role} → ${x.note ?? `HTTP ${x.status}, waiting for owner approval`}`).join("; ")}.`);
     } catch (e) { setOut(`${what} failed: ${e instanceof Error ? e.message : e}`); }
-    finally { setBusy(false); }
+    finally { setBusy(false); void load(); }
   }
+
+  const name = (u: string) => u.charAt(0).toUpperCase() + u.slice(1);
+
   return (
     <section className="card">
       <h2>Household members</h2>
+      <p className="muted small">Adding or removing anyone, or making them an owner, files a request. Nothing changes until enough owners approve it in the Tide enclave.</p>
+      {err && <ErrorBox title="Could not load members" detail={err} />}
       <table className="members">
         <tbody>
-          <tr><td>Alex, Sam, Riley</td><td><span className="badge ok">owners</span></td><td className="muted small">view footage · approve changes in the Tide enclave (2 of 3 once all are owners)</td></tr>
-          <tr><td>Jordan</td><td><span className="badge warn">housemate</span></td><td><button className="btn" disabled={busy} onClick={() => request("/api/household/request-viewer", "jordan", "Request viewing access for Jordan")}>Request viewing access</button></td></tr>
+          {list?.map((m) => {
+            const pending = m.pending.length > 0;
+            return (
+              <tr key={m.username}>
+                <td>
+                  <b>{name(m.username)}</b>{m.username === me.username && <span className="muted tiny"> (you)</span>}
+                  {!m.linked && <div className="muted tiny">no Tide account yet</div>}
+                </td>
+                <td>
+                  {m.owner && <span className="badge ok">owner</span>}
+                  {m.viewer && !m.owner && <span className="badge ok">can view</span>}
+                  {!m.viewer && <span className="badge warn">no access</span>}
+                  {pending && <div className="muted tiny">{m.pending.map((p) => PENDING_TEXT[p] ?? `${p} pending`).join(", ")}</div>}
+                </td>
+                <td>
+                  <div className="row">
+                    {!m.viewer && <button className="btn" disabled={busy || pending} onClick={() => request("/api/household/request-viewer", m.username, `Give ${name(m.username)} access`)}>Request viewing access</button>}
+                    {/* No self-removal: the server refuses it too (403); this just doesn't offer it. */}
+                    {m.viewer && m.username !== me.username && <button className="btn danger" disabled={busy || pending} onClick={() => request("/api/household/revoke-viewer", m.username, `Remove ${name(m.username)}'s access`)}>Remove access</button>}
+                    {m.viewer && m.username === me.username && <span className="muted tiny">another owner must remove you</span>}
+                    {m.viewer && !m.owner && m.linked && <button className="btn ghost" disabled={busy || pending} onClick={() => request("/api/household/request-owner", m.username, `Make ${name(m.username)} an owner`)}>Make owner</button>}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
-      <details className="setup">
-        <summary className="muted small">Setup: make Sam and Riley approvers (one-time)</summary>
-        <div className="row">
-          <button className="btn" disabled={busy} onClick={() => request("/api/household/request-owner", "sam", "Make Sam an owner")}>Make Sam an owner</button>
-          <button className="btn" disabled={busy} onClick={() => request("/api/household/request-owner", "riley", "Make Riley an owner")}>Make Riley an owner</button>
-        </div>
-      </details>
+      <p className="muted tiny">Removal takes effect at that person's next sign-in, or within about 10 minutes when their login refreshes. Anything they already saved from the screen can't be clawed back.</p>
       {out && <p className="small">{out}</p>}
     </section>
   );
