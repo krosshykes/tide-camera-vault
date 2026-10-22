@@ -30,6 +30,8 @@ This document covers the architecture, every workflow (with diagrams), the secur
 19. [Known limits and design trade-offs](#19-known-limits-and-design-trade-offs)
 20. [Glossary](#20-glossary)
 21. [Many households: sign-up and provisioning](#21-many-households-sign-up-and-provisioning)
+22. [CamCo staff: sign-in and operations](#22-camco-staff-sign-in-and-operations)
+23. [Household copies: surviving vendor deletion](#23-household-copies-surviving-vendor-deletion)
 
 ---
 
@@ -96,6 +98,7 @@ flowchart LR
 | **Approve** a role change | ✅ (enclave signature) | ❌ | ❌ | ❌ | ❌ **409 / refused** |
 | Make a change apply alone | ❌ needs 2 of 3 | ❌ | ❌ | ❌ | ❌ **412 / quorum not met** |
 | Remove their own access | ❌ (server 403) | — | ❌ | — | — |
+| Delete clips | ✅ any clip | — | ✅ own uploads only | ❌ no household route. CamCo can destroy ciphertext on its own disks (demo: **Delete ciphertext**), a denial of service, never a disclosure, and households keep their own copy (§23) | ❌ |
 
 ---
 
@@ -136,7 +139,7 @@ flowchart TB
 sequenceDiagram
   autonumber
   actor A as Alex (browser)
-  participant Cam as Camera source<br/>(synthetic / webcam / DroidCam)
+  participant Cam as Registered camera<br/>(webcam / DroidCam)
   participant WC as WebCrypto
   participant API as CamCo backend
   participant ORK as Tide network (20 ORKs)
@@ -331,7 +334,7 @@ stateDiagram-v2
 
 ## 12. Live camera and motion detection
 
-A real camera (DroidCam's virtual webcam, or the laptop webcam) is an optional source that feeds **the same encrypt pipeline** as the synthetic scenes.
+A household registers **several cameras** (owners add or remove them; a name and a location, which CamCo can see as metadata). Each camera tile is fed by a video device on a member's computer: DroidCam's virtual webcam for a phone, a laptop webcam, any capture device. Which device feeds which camera is remembered in that browser. Each tile has its own preview, snapshot and record buttons, **its own motion detection** and its own upload progress, so several cameras can run and trigger at once. Every clip is tagged with its camera and goes through the same encrypt pipeline.
 
 ```mermaid
 stateDiagram-v2
@@ -422,15 +425,25 @@ Every route except `/api/health` verifies the **Tide JWT** (embedded JWKS, issue
 | GET | `/api/households/:id` | anyone with the code | household name and status |
 | GET | `/api/households/:id/adapter` | anyone with the code | that realm's public sign-in config |
 | POST | `/api/signup` | anyone (3/hour/IP) | start provisioning a new household |
+| GET | `/api/staff-realm` | anyone | which realm the `/staff` page signs in to |
 | GET | `/api/signup/:token` | the person who signed up | provisioning progress + first owner's invite link |
 | GET | `/api/me` | signed in | username, roles, owner / household / vendor flags |
 | GET | `/api/vault/status` | signed in | has the vault been created, by whom |
 | GET | `/api/vault/policy` | household | the signed vault policy |
 | PUT | `/api/vault/policy` | owner | store the policy after enclave signing |
 | GET | `/api/admin-policy` | owner | realm admin policy, needed to sign the vault policy |
-| POST | `/api/clips` | household | upload ciphertext + wrapped key |
+| GET | `/api/cameras` | household | the household's registered cameras |
+| POST | `/api/cameras` | owner | register a camera (name, location; max 16) |
+| DELETE | `/api/cameras/:id` | owner | remove a camera (its clips are kept) |
+| POST | `/api/clips` | household | upload ciphertext + wrapped key, tagged with a registered `cameraId` |
 | GET | `/api/clips` | household | list event metadata |
 | GET | `/api/clips/:id` | household | one clip's ciphertext + wrapped key |
+| POST | `/api/clips/delete` | household | delete clips by id: owners any, others only their own uploads |
+| GET | `/api/clips/tombstones` | household | deliberate deletions (household or retention), to tell them apart from silent loss |
+| GET | `/api/storage` | household | used vs allowance, snapshots/videos, per-camera breakdown, retention |
+| PUT | `/api/storage/retention` | owner | auto-delete after 7, 30 or 90 days, or keep (`null`) |
+| GET | `/api/settings` | signed in | household settings (timezone) |
+| PUT | `/api/settings/timezone` | owner | set the household timezone (IANA name, validated) |
 | GET | `/api/directory` | signed in | user-id → name and role-id → name, for readable approvals |
 | GET | `/api/household/members` | owner | live member status from TideCloak |
 | POST | `/api/household/request-viewer` | owner | **file** a `household-viewer` grant |
@@ -439,7 +452,13 @@ Every route except `/api/health` verifies the **Tide JWT** (embedded JWKS, issue
 | POST | `/api/household/invite` | owner | **file** CREATE_USER for a new person (no access) |
 | POST | `/api/household/invite-link` | owner | 12h Tide account link for someone not yet linked |
 | GET | `/api/audit` | household / vendor | recent events |
-| GET | `/api/vendor/households` | CamCo staff | every household: realm, status, clip count |
+| GET | `/api/household/notices` | household | everything CamCo did that touched this household |
+| GET | `/api/vendor/households` | CamCo staff | every household: status, cameras, clips, storage, last upload |
+| GET | `/api/vendor/ops` | CamCo staff | service health: TideCloak, 20 ORKs, storage totals |
+| GET | `/api/vendor/fleet?household=` | CamCo staff | per-camera events, last seen, bytes |
+| POST | `/api/vendor/households/:id/reissue-link` | CamCo staff | fresh setup link, only while waiting for the owner |
+| POST | `/api/vendor/clips/:id/destroy?household=` | CamCo staff | demo of the availability threat: deletes ciphertext with no tombstone |
+| GET/POST | `/api/vendor/legal-requests` | CamCo staff | log a request for footage; the household is notified |
 | GET | `/api/vendor/records?household=` | CamCo staff | raw DB rows |
 | GET | `/api/vendor/change-requests` | CamCo staff | pending requests as root sees them |
 | POST | `/api/vendor/self-grant` | CamCo staff | root tries to grant itself `household-viewer` |
@@ -465,9 +484,9 @@ server/src/
 web/src/
   Home.tsx               Signed-out home page
   App.tsx                Auth callback, routing by identity (Household vs Vendor)
-  household/Household.tsx  Vault setup, cameras, gallery/viewer, approvals, members
+  household/Household.tsx  Vault setup, gallery/viewer, approvals, members, notices
+  household/Cameras.tsx    Registered cameras: one tile each (device, preview, capture, motion)
   vendor/VendorConsole.tsx Raw storage, refused decrypt, self-grant + force attempts
-  camera/scenes.ts       Synthetic CCTV scenes (PNG snapshot, WebM clip)
   camera/live.ts         Real camera: open, snapshot, recorder
   camera/motion.ts       Frame-differencing motion detector
   lib/crypto.ts          AES-256-GCM (WebCrypto)
@@ -529,7 +548,7 @@ Problems met while building this, and their fixes.
 - **Metadata isn't hidden.** CamCo sees camera names, times, sizes and who uploaded. Hiding these would need encrypted metadata and padding.
 - **Revocation is eventual.** It applies at the next sign-in or token refresh (access tokens last 10 minutes). Anything already decrypted and saved can't be recalled.
 - **The vault is one record.** All clips share `household-vault`, so access is all-or-nothing per household. Per-camera or per-clip sharing (e.g. releasing one clip to police) would add records and policies.
-- **The server can still deny service** (delete ciphertext, go offline). TideCloak's hosting is an availability trust, not a confidentiality one.
+- **CamCo can still deny service** (delete ciphertext, go offline), but it no longer holds the only copy: households keep their own encrypted copies and detect silent deletions (§23). A deletion record CamCo forges would hide a deletion from the check, but not destroy the household's copy. Making those records trustworthy would need them signed by the deleting member's own key.
 - **Vendor staff are identified by username** (`VENDOR_STAFF`, default `camco-support`) for the demo console. Their *lack* of access is enforced by Tide, not by that list.
 - **Development setup.** HTTP on localhost, an H2 database inside the container, and an in-memory DPoP replay store (single process).
 
@@ -604,3 +623,80 @@ sequenceDiagram
 - **Every realm is licensed under the operator's email** (`TIDE_LICENSE_EMAIL`), because the operator is the Tide licensee. Licence tiers and per-household pricing are for Tide to answer.
 - **Sign-up has only basic abuse control** (3 per IP per hour) and no email verification. Invite links are shown on screen instead of emailed.
 - **Branding is set once**, on the demo realm. Provisioned realms show Tide's default sign-in branding.
+
+---
+
+## 22. CamCo staff: sign-in and operations
+
+**Separate realm, separate door.** CamCo staff sign in at **`/staff`** (linked from the home page footer), which signs in to CamCo's own **`camco-staff`** realm. It isn't any customer's realm, and no one in it holds a household role. With `PROVISION_STAFF_REALM=yes` in `.env`, the backend creates it at start-up with the same provisioning pipeline, and its first staff account's setup link goes to the operator: the server log and `server/data/staff-invite.txt`. Until that account is linked, the demo realm's `camco-support` still works as the legacy vendor login, and the `/staff` page uses it automatically.
+
+> **Current status:** on our free-tier licence, Tide's licensing refused this third realm three times running (`TIDE-IDPEXT-VENDOR-KEYGEN_FAILED`, Midgard `FinalizeWallet` → HTTP 500), while the first two realms licensed normally. That points to a per-licence realm limit, which Tide would need to raise. Failed attempts are cleaned up automatically, so nothing is left half-made.
+
+```mermaid
+flowchart LR
+  subgraph Staff["camco-staff realm (CamCo)"]
+    S["CamCo staff<br/>no household roles"]
+  end
+  subgraph H1["hh-… realm (a household)"]
+    O1["Owners: quorum"]
+    V1["Vault policy"]
+  end
+  subgraph H2["camera-vault (demo household)"]
+    O2["Owners: quorum"]
+  end
+  S -- "metadata, health, legal log" --> API["CamCo backend"]
+  API -- "root: FILES requests only" --> H1
+  API -- "root: FILES requests only" --> H2
+  O1 -- "approve / deny" --> H1
+  S -. "decrypt attempt: refused<br/>(different realm, no role)" .-> V1
+```
+
+**What staff do: real work, all from metadata**
+
+| Panel | What it gives CamCo | What it never needs |
+|---|---|---|
+| **Service health** | TideCloak up/down and latency; ORKs reachable out of 20 (needs 14); stored bytes and clip count | footage |
+| **Customers** | status and age of each household's setup, cameras, clips, storage, last upload | keys |
+| **Re-issue setup link** | rescue a stuck sign-up. Only works while the owner hasn't created their Tide account; afterwards nobody at CamCo can stand in for them | |
+| **Camera fleet** | per camera: active/quiet, last seen, events, videos, bytes. Answers "my camera stopped recording" | |
+| **Legal & police requests** | logged with requester, reference and scope. The recorded outcome: CamCo can't disclose footage (it holds no key) and refers the requester to the household; metadata can be provided under legal process | |
+| **Try to look inside** | the demo tab: raw ciphertext, a refused decrypt, root's self-grant stuck pending, force-approve refused | |
+
+**Transparency to households.** Every vendor action that touches a household (self-grant attempts, force-approve attempts, re-issued setup links, legal requests) is written into **that household's own log**. Members see it under **CamCo activity on your household**.
+
+
+---
+
+## 23. Household copies: surviving vendor deletion
+
+Tide makes CamCo unable to **read** or **release** footage. It can't stop CamCo **destroying** ciphertext on disks it controls. That's availability, a separate property, so the household keeps its own copies. Ciphertext is safe to copy anywhere: nothing in it opens without the household's Tide-governed key.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor A as Alex's browser
+  participant L as Household copy<br/>(this device + optional USB/NAS folder)
+  participant API as CamCo cloud
+  actor C as CamCo (rogue admin / bug / breach)
+
+  A->>A: encrypt clip, Tide wraps key
+  A->>L: save ciphertext + IV + wrapped key (id chosen here)
+  A->>API: upload with the same id
+  C->>API: delete ciphertext directly (no tombstone)
+  A->>API: GET /api/clips + /api/clips/tombstones
+  Note over A: In my copy, not in the cloud, no household deletion recorded<br/>→ "missing from CamCo's cloud: not deleted by your household"
+  A->>L: play the household copy (Tide still unwraps the key for Alex)
+  A->>API: Restore: re-upload the same ciphertext (restore: true)
+```
+
+| Piece | Behaviour |
+|---|---|
+| **This device** | IndexedDB, on by default per household. Written **before** the upload, so an outage loses nothing (the row says "its upload never finished"). |
+| **Backup folder** | Optional: a USB drive or NAS share chosen in Chrome or Edge (File System Access API). One `.camvault.json` per clip, holding only ciphertext, IV and wrapped key. If the browser forgets permission between visits, **Allow folder access** asks again. |
+| **Copy cloud clips here** | Pulls the ciphertext of clips recorded earlier or on other devices. |
+| **Tombstones** | Every household deletion and retention clean-up is recorded on the server. Devices remove their copies of tombstoned clips, so a household deletion still deletes everywhere. |
+| **Integrity check** | Each time the panel loads: in this device's copy, not in CamCo's list, no tombstone → flagged, with **View household copy** and **Restore to CamCo's cloud**. |
+
+**Demo:** as CamCo, **Try to look inside** → **Delete ciphertext** on a clip. Then as Alex, **Household copy** shows the clip missing *"not deleted by your household"*. **View household copy** plays it, and **Restore** puts it back.
+
+**Limits.** CamCo runs the server, so it could forge a tombstone. The check would then miss that deletion, but the household's copy would still exist. Signing deletion records with the deleting member's own key would close that gap. Copies already written to a backup folder are left for the household to manage.

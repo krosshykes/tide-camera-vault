@@ -11,9 +11,9 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "./paths.ts";
+import { DATA_DIR, ROOT } from "./paths.ts";
 import { rootCall, listChangeRequests, userByName, realmManagementClient, TC } from "./tidecloakAdmin.ts";
-import { addHousehold, household, households, newHouseholdPaths, updateHousehold, type Household } from "./households.ts";
+import { addHousehold, household, households, newHouseholdPaths, updateHousehold, removeHousehold, staffRealm, STAFF_ID, type Household } from "./households.ts";
 
 const APP_URL = process.env.CLIENT_APP_URL || "http://localhost:5173";
 const SKIP = new Set(["DISABLE_IGA", "DELETE_REALM", "OFFBOARD_REALM"]);
@@ -59,6 +59,40 @@ export function startSignup(input: SignupInput): Household {
   return h;
 }
 
+/**
+ * CamCo's own staff realm, separate from every customer's. Created once, at server start, by the
+ * same pipeline. Its first staff member (camco-support) becomes its admin; no one in it holds any
+ * household role, and no household realm trusts it for anything.
+ */
+export function ensureStaffRealm() {
+  // Opt-in (PROVISION_STAFF_REALM=yes): each attempt creates and licenses a realm with Tide, and
+  // the free tier has refused this one (VENDOR-KEYGEN_FAILED). Until then /staff uses the demo
+  // realm's camco-support account.
+  if (process.env.PROVISION_STAFF_REALM !== "yes") return;
+  const existing = staffRealm();
+  if (existing && existing.status !== "failed") return;
+  if (existing) {
+    // A failed attempt: forget it and try again. If it failed after IGA was on, its realm still
+    // exists and the import below fails loudly instead of creating a second one.
+    console.log(`[provision] retrying the CamCo staff realm (last error: ${existing.error ?? "?"})`);
+    removeHousehold(existing.id);
+  }
+  try { licence(); } catch (e) { console.warn(`[provision] not creating the CamCo staff realm: ${e instanceof Error ? e.message : e}`); return; }
+  const h: Household = {
+    id: STAFF_ID, kind: "vendor", name: "CamCo Staff", realm: STAFF_ID, client: `${STAFF_ID}-client`, ...newHouseholdPaths(STAFF_ID),
+    status: "provisioning", createdAt: Date.now(), owner: "camco-support",
+  };
+  addHousehold(h);
+  queue = queue.then(() => provision(h.id, { householdName: h.name, ownerName: "CamCo Support", username: "camco-support" })).catch(() => {});
+}
+
+// The staff invite goes to the operator (server log + a gitignored file), never to the web.
+function announceStaffInvite(link: string) {
+  const file = join(DATA_DIR, "staff-invite.txt");
+  writeFileSync(file, `camco-support (CamCo staff realm): ${link}\n`);
+  console.log(`\n================ CamCo staff realm ================\nCreate the camco-support Tide account (valid 12h):\n${link}\n(also in server/data/staff-invite.txt)\n==================================================\n`);
+}
+
 // One provisioning at a time: each runs many root calls and Tide ceremonies.
 let queue: Promise<void> = Promise.resolve();
 
@@ -81,30 +115,40 @@ function step(id: string, detail: string) {
 async function provision(id: string, input: SignupInput) {
   const h = household(id)!;
   const r = h.realm;
+  let governed = false; // set once IGA is being switched on
   try {
-    // 1. realm from template
-    step(id, "creating realm");
-    const tpl = readFileSync(join(ROOT, "scripts", "realm.json.template"), "utf8")
-      .replaceAll("REALM_NAME", r).replaceAll("CLIENT_NAME", h.client).replaceAll("CLIENT_APP_URL", APP_URL);
-    const created = await rootCall("", "POST", "", JSON.parse(tpl));
-    if (created.status >= 300) throw new Error(`realm import failed (HTTP ${created.status}): ${created.text.slice(0, 200)}`);
+    // 1-3. realm from template, no profile-review page, licence + keys.
+    // Tide's licensing can answer a 500 (VENDOR-KEYGEN_FAILED, "please retry"). Retrying on the SAME
+    // realm fails with a duplicate-model error (the first attempt already created its Tide IdP), so
+    // every retry starts from a fresh realm. NEED_PAYMENT / 303 are final: no free licence.
+    let last = "";
+    for (let attempt = 1; ; attempt++) {
+      step(id, attempt === 1 ? "creating realm" : `creating realm (attempt ${attempt})`);
+      const tpl = readFileSync(join(ROOT, "scripts", "realm.json.template"), "utf8")
+        .replaceAll("REALM_NAME", r).replaceAll("CLIENT_NAME", h.client).replaceAll("CLIENT_APP_URL", APP_URL);
+      const created = await rootCall("", "POST", "", JSON.parse(tpl));
+      if (created.status >= 300) throw new Error(`realm import failed (HTTP ${created.status}): ${created.text.slice(0, 200)}`);
 
-    // 2. no Keycloak "Update Account Information" page (must happen before IGA)
-    const flows = (await rootCall(r, "GET", "/authentication/flows/first%20broker%20login/executions")).body as { providerId: string; id: string; authenticationConfig?: string }[];
-    const review = flows?.find((e) => e.providerId === "idp-review-profile");
-    const cfg = { alias: "review profile config", config: { "update.profile.on.first.login": "off" } };
-    if (review?.authenticationConfig) await rootCall(r, "PUT", `/authentication/config/${review.authenticationConfig}`, cfg);
-    else if (review?.id) await rootCall(r, "POST", `/authentication/executions/${review.id}/config`, cfg);
+      // no Keycloak "Update Account Information" page (must happen before IGA)
+      const flows = (await rootCall(r, "GET", "/authentication/flows/first%20broker%20login/executions")).body as { providerId: string; id: string; authenticationConfig?: string }[];
+      const review = flows?.find((e) => e.providerId === "idp-review-profile");
+      const cfg = { alias: "review profile config", config: { "update.profile.on.first.login": "off" } };
+      if (review?.authenticationConfig) await rootCall(r, "PUT", `/authentication/config/${review.authenticationConfig}`, cfg);
+      else if (review?.id) await rootCall(r, "POST", `/authentication/executions/${review.id}/config`, cfg);
 
-    // 3. licence + keys
-    step(id, "licensing");
-    const setup = await rootCall(r, "POST", "/vendorResources/setUpTideRealm", { email: licence(), isRagnarokEnabled: "true" }, { form: true });
-    if (setup.status < 200 || setup.status >= 300 || setup.text.includes("NEED_PAYMENT")) {
-      throw new Error(`Tide licensing failed (HTTP ${setup.status}): ${setup.text.slice(0, 200)}`);
+      step(id, "licensing");
+      const setup = await rootCall(r, "POST", "/vendorResources/setUpTideRealm", { email: licence(), isRagnarokEnabled: "true" }, { form: true });
+      if (setup.status === 303 || setup.text.includes("NEED_PAYMENT")) throw new Error(`Tide licensing needs payment (HTTP ${setup.status}): no free-tier licence for this realm`);
+      if (setup.status >= 200 && setup.status < 300) break;
+      last = `HTTP ${setup.status}: ${setup.text.slice(0, 200)}`;
+      await rootCall(r, "DELETE", ""); // ungoverned so far: safe to remove and start again
+      if (attempt >= 3) throw new Error(`Tide licensing failed after 3 fresh attempts (${last})`);
+      await sleep(attempt * 15_000);
     }
 
-    // 4. cryptographic governance on
+    // 4. cryptographic governance on. Past this point the realm is governed and stays.
     step(id, "enabling IGA");
+    governed = true;
     const rep = (await rootCall(r, "GET", "")).body as { attributes?: Record<string, string> };
     rep.attributes = { ...(rep.attributes ?? {}), "iga.attestor": "tide" };
     await rootCall(r, "PUT", "", rep);
@@ -124,21 +168,31 @@ async function provision(id: string, input: SignupInput) {
     await drain(r);
     const owner = await userByName(r, input.username);
     if (!owner) throw new Error("owner not found after creation");
-    const viewer = (await rootCall(r, "GET", "/roles/household-viewer")).body as { id: string; name: string };
-    await rootCall(r, "POST", `/users/${owner.id}/role-mappings/realm`, [{ id: viewer.id, name: viewer.name }]);
-    await sleep(1000);
-    await drain(r);
+    // Household owners hold the vault role. CamCo staff never do: their realm has no footage.
+    if (h.kind !== "vendor") {
+      const viewer = (await rootCall(r, "GET", "/roles/household-viewer")).body as { id: string; name: string };
+      await rootCall(r, "POST", `/users/${owner.id}/role-mappings/realm`, [{ id: viewer.id, name: viewer.name }]);
+      await sleep(1000);
+      await drain(r);
+    }
 
     // 6. the owner creates their Tide account
     const link = await rootCall(r, "POST", `/tideAdminResources/get-required-action-link?userId=${owner.id}&lifespan=43200`, ["link-tide-account-action"]);
     if (link.status >= 300) throw new Error(`invite link failed (HTTP ${link.status})`);
     updateHousehold(id, { status: "awaiting-owner", inviteLink: link.text.trim() });
+    if (h.kind === "vendor") announceStaffInvite(link.text.trim());
     step(id, "waiting for the owner to link a Tide account");
     // Not awaited: waiting for a person can take hours and must not hold up other sign-ups.
     void waitThenFinish(id);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     step(id, `FAILED: ${msg}`);
+    // Before IGA is on, the half-made realm is ungoverned and can simply be deleted, so a retry
+    // starts clean. After that, deleting it is itself a governed request: leave it for the operator.
+    if (!governed) {
+      const del = await rootCall(r, "DELETE", "").catch(() => null);
+      step(id, `removed the unfinished realm (HTTP ${del?.status ?? "?"})`);
+    }
     updateHousehold(id, { status: "failed", error: msg });
   }
 }

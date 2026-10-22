@@ -13,6 +13,7 @@ export type HouseholdStatus = "provisioning" | "awaiting-owner" | "finalizing" |
 
 export interface Household {
   id: string;
+  kind?: "household" | "vendor"; // vendor = CamCo staff realm; absent means household
   name: string;
   realm: string;
   client: string;
@@ -27,7 +28,10 @@ export interface Household {
 }
 
 const REGISTRY = join(DATA_DIR, "households.json");
+// The demo household from `npm run bootstrap`. Its camco-support account is the legacy vendor login,
+// used until CamCo has its own staff realm.
 export const VENDOR_REALM = process.env.REALM_NAME || "camera-vault";
+export const STAFF_ID = "camco-staff";
 
 // The household made by `npm run bootstrap` is registered as the first one, at its original paths.
 function seed(): Household[] {
@@ -83,4 +87,14 @@ export function adapterOf(h: Household): Record<string, unknown> | null {
 }
 
 /** Public view of a household: safe to show anyone who has its id. */
-export const publicView = (h: Household) => ({ id: h.id, name: h.name, status: h.status, createdAt: h.createdAt });
+export const publicView = (h: Household) => ({ id: h.id, name: h.name, status: h.status, createdAt: h.createdAt, kind: h.kind ?? "household" });
+
+export const isStaffRealm = (h: Household) => h.kind === "vendor";
+export const customerHouseholds = () => households().filter((h) => !isStaffRealm(h));
+export const staffRealm = () => households().find(isStaffRealm);
+
+export function removeHousehold(id: string) {
+  const list = households();
+  const i = list.findIndex((h) => h.id === id);
+  if (i >= 0) { list.splice(i, 1); saveRegistry(); }
+}

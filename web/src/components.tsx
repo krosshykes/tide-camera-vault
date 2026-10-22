@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatWhen } from "./lib/time";
 
 export type StepState = "pending" | "running" | "ok" | "fail";
 export interface Step { label: string; state: StepState; note?: string }
@@ -54,7 +55,8 @@ export function Media({ bytes, mime }: { bytes: Uint8Array; mime: string }) {
 
 export const short = (s: string, n = 48) => (s.length > n ? `${s.slice(0, n)}…` : s);
 export const kb = (bytes: number) => `${(bytes / 1024).toFixed(1)} KB`;
-export const when = (t: number) => new Date(t).toLocaleString();
+// Always in the household's timezone (lib/time.ts), not whatever this device is set to.
+export const when = (t: number) => formatWhen(t);
 
 export function ErrorBox({ title, detail }: { title: string; detail?: string }) {
   return (

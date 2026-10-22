@@ -135,8 +135,9 @@ export function Home({ onSignIn }: { onSignIn: () => void }) {
       </section>
 
       <footer className="home-footer">
-        <span>Prototype for the RMIT × Tide UNLOCKED hackathon. Cameras and footage are synthetic.</span>
+        <span>Prototype for the RMIT × Tide UNLOCKED hackathon. No real footage ships with it.</span>
         <span>Secured with <b>TideCloak</b>: no master key, quorum-approved access.</span>
+        <a className="staff-link" href="/staff">CamCo staff sign-in</a>
       </footer>
     </div>
   );

@@ -1,7 +1,9 @@
 // A real camera (e.g. DroidCam's virtual webcam, or the laptop webcam) as an optional source.
 // Frames are drawn onto a canvas with a CCTV-style stamp, then go through exactly the same
-// pipeline as the synthetic feeds: encrypted in this browser before anything is uploaded.
+// pipeline: encrypted in this browser before anything is uploaded.
 // getUserMedia needs a secure context; http://localhost counts as one.
+
+import { cameraStamp } from "../lib/time";
 
 const W = 640;
 const H = 360;
@@ -26,7 +28,9 @@ function stamp(g: CanvasRenderingContext2D, camera: string) {
   g.fillStyle = "#e8eef5";
   g.font = "bold 13px ui-monospace, Consolas, monospace";
   g.fillText(`● LIVE  ${camera.toUpperCase()}`, 10, 17);
-  g.fillText(new Date().toISOString().replace("T", " ").slice(0, 19), W - 160, 17);
+  // Burned into the footage in the household's timezone, e.g. "2026-10-23 03:04:05 AEDT".
+  const t = cameraStamp();
+  g.fillText(t, W - 10 - g.measureText(t).width, 17);
 }
 
 // Letterbox the video into 640x360 so file sizes stay small whatever the camera resolution.

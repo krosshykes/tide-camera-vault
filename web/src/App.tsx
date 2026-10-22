@@ -4,6 +4,7 @@ import { api, type Me } from "./lib/api";
 import { Household } from "./household/Household";
 import { VendorConsole } from "./vendor/VendorConsole";
 import { Home } from "./Home";
+import { TimezoneControl, loadHouseholdTimezone } from "./Timezone";
 
 // isInitializing must be checked BEFORE Authenticated/Unauthenticated guards (template rule).
 export default function App() {
@@ -48,11 +49,20 @@ function SignedIn() {
   const { logout } = useTideCloak();
   const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState("");
+  // The household timezone is loaded before anything renders a time. Changing it re-renders the
+  // whole page through this state, without remounting anything (running cameras keep running).
+  const [tz, setTz] = useState<{ saved: string | null } | null>(null);
 
-  useEffect(() => { api<Me>("/api/me").then(setMe).catch((e) => setError(String(e.message ?? e))); }, []);
+  useEffect(() => {
+    api<Me>("/api/me").then(setMe).catch((e) => setError(String(e.message ?? e)));
+    loadHouseholdTimezone().then((saved) => setTz({ saved }));
+    // Pick up a change another owner made, within a minute.
+    const t = setInterval(() => loadHouseholdTimezone().then((saved) => setTz((cur) => (cur?.saved === saved ? cur : { saved }))), 60_000);
+    return () => clearInterval(t);
+  }, []);
 
   if (error) return <Centered>Could not reach the CamCo backend: {error}</Centered>;
-  if (!me) return <Centered>Loading...</Centered>;
+  if (!me || !tz) return <Centered>Loading...</Centered>;
 
   return (
     <div className={me.isVendor ? "app vendor" : "app household"}>
@@ -64,6 +74,7 @@ function SignedIn() {
           <span className={`area-tag ${me.isVendor ? "vendor" : "household"}`}>{me.isVendor ? "VENDOR · INTERNAL" : "HOUSEHOLD APP"}</span>
         </div>
         <div className="who">
+          <TimezoneControl canEdit={me.isOwner} saved={tz.saved} onChange={(saved) => setTz({ saved })} />
           <span className="user-chip">{me.username}</span>
           {me.isOwner && <span className="badge ok">owner · approver</span>}
           {me.isHousehold && !me.isOwner && <span className="badge ok">household viewer</span>}

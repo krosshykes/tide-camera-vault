@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { TideCloakContextProvider } from "@tidecloak/react";
 import App from "./App";
 import { Signup } from "./Signup";
+import { Staff } from "./Staff";
 import { loadTenant } from "./lib/tenant";
 import "./styles.css";
 
@@ -12,6 +13,11 @@ async function boot() {
   // Signing up creates a household, so it runs before any household's Tide config exists.
   if (window.location.pathname.startsWith("/signup")) {
     root.render(<React.StrictMode><Signup /></React.StrictMode>);
+    return;
+  }
+  // Staff sign-in is its own page; it picks CamCo's staff realm, then signs in to it.
+  if (window.location.pathname.startsWith("/staff")) {
+    root.render(<React.StrictMode><Staff /></React.StrictMode>);
     return;
   }
   try {

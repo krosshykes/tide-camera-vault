@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type ClipMeta, type Clip, type Me } from "../lib/api";
-import { encryptClip, decryptClip } from "../lib/crypto";
-import { vaultPolicy, signVaultPolicy, wrapKey, unwrapKey, explainTideError, VAULT_ROLE } from "../lib/vault";
+import { decryptClip } from "../lib/crypto";
+import { vaultPolicy, signVaultPolicy, unwrapKey, explainTideError, VAULT_ROLE } from "../lib/vault";
 import { listPending, approveChangeRequest, denyChangeRequest, describe, tally, type ChangeRequest, type Directory } from "../lib/iga";
-import { SCENES, snapshot, recordClip, type Scene } from "../camera/scenes";
-import { listCameras, openCamera, liveSnapshot, liveClip } from "../camera/live";
-import { watchMotion, thresholdFor, type MotionState } from "../camera/motion";
+import { Cameras } from "./Cameras";
+import { tenant } from "../lib/tenant";
+import {
+  listClips, putClip, deleteClips as deleteLocal, markInCloud, localCopyEnabled, setLocalCopyEnabled,
+  folderSupported, getFolder, chooseFolder, forgetFolder, folderReady, writeToFolder, type LocalClip,
+} from "../lib/localVault";
 import { Steps, useSteps, Media, ErrorBox, kb, when } from "../components";
 
 export function Household({ me }: { me: Me }) {
   const [vault, setVault] = useState<{ hasPolicy: boolean; signedBy: string | null } | null>(null);
   const [clips, setClips] = useState<ClipMeta[] | null>(null);
   const [clipsError, setClipsError] = useState<string>("");
+  const [version, setVersion] = useState(0); // bumps whenever clips change, so Storage reloads
 
   const refreshVault = useCallback(() => api<{ hasPolicy: boolean; signedBy: string | null }>("/api/vault/status").then(setVault), []);
   const refreshClips = useCallback(() => {
+    setVersion((v) => v + 1);
     api<ClipMeta[]>("/api/clips").then((c) => { setClips(c); setClipsError(""); })
       .catch((e) => setClipsError(e instanceof ApiError && e.status === 403 ? "forbidden" : String(e.message)));
   }, []);
@@ -25,10 +30,13 @@ export function Household({ me }: { me: Me }) {
     <div className="grid">
       {!me.isHousehold && <NoAccess me={me} />}
       {me.isOwner && vault && !vault.hasPolicy && <VaultSetup onDone={refreshVault} />}
-      {me.isHousehold && vault?.hasPolicy && <CameraSimulator onUploaded={refreshClips} />}
-      {me.isHousehold && <Gallery clips={clips} error={clipsError} />}
+      {me.isHousehold && vault?.hasPolicy && <Cameras me={me} onUploaded={refreshClips} />}
+      {me.isHousehold && <Gallery me={me} clips={clips} error={clipsError} onChanged={refreshClips} />}
+      {me.isHousehold && <StoragePanel me={me} version={version} />}
+      {me.isHousehold && <HouseholdCopy clips={clips} onChanged={refreshClips} />}
       {me.isOwner && <Approvals me={me} />}
       {me.isOwner && <Members me={me} />}
+      {me.isHousehold && <Notices />}
       {vault?.hasPolicy && (
         <p className="muted small span-all">
           Vault policy <code>RelationshipAttestation:1</code> (subject: role <code>{VAULT_ROLE}</code>) signed by {vault.signedBy} in the Tide enclave.
@@ -76,300 +84,130 @@ function VaultSetup({ onDone }: { onDone: () => void }) {
   );
 }
 
-interface Source {
-  camera: string;
-  label: string;
-  live: boolean;
-  first?: string; // overrides the first step label (motion clips are already recorded)
-  produce: (video: boolean) => Promise<{ bytes: Uint8Array; mime: string }>;
+// Owners can delete any clip; other members only their own. The server enforces the same rule.
+const canDelete = (me: Me, c: ClipMeta) => me.isOwner || c.uploadedBy === me.username;
+
+async function deleteClips(ids: string[]) {
+  const r = await api<{ deleted: string[]; refused: string[] }>("/api/clips/delete", { method: "POST", body: JSON.stringify({ ids }) });
+  // A household deletion removes this device's copy too (other devices follow the tombstone).
+  await deleteLocal(r.deleted).catch(() => {});
+  return r;
 }
 
-function CameraSimulator({ onUploaded }: { onUploaded: () => void }) {
-  const { steps, run } = useSteps();
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<{ title: string; detail?: string } | null>(null);
-  const [preview, setPreview] = useState<{ bytes: Uint8Array; mime: string } | null>(null);
-
-  // One pipeline for every source: the synthetic scenes and a real camera are treated identically.
-  async function capture(src: Source, video: boolean) {
-    setBusy(true); setErr(null); setPreview(null);
-    const what = src.live ? "real camera" : "synthetic feed";
-    try {
-      await run([
-        src.first ?? (video ? `Camera records a 3-second clip (${what})` : `Camera takes a snapshot (${what})`),
-        "Encrypt it in this browser with a fresh AES-256-GCM key",
-        "Tide network wraps the AES key under the household vault policy",
-        "Upload ciphertext + wrapped key to CamCo cloud",
-      ], async (step) => {
-        const media = await src.produce(video);
-        setPreview(media);
-        step(0, `${kb(media.bytes.length)} ${media.mime}, plaintext stays on this device`);
-        const enc = await encryptClip(media.bytes);
-        step(1, `${kb(enc.ciphertext.length * 0.75)} of ciphertext`);
-        const policy = await vaultPolicy();
-        const wrappedKey = await wrapKey(enc.rawKey, policy);
-        step(2, "no one, including CamCo, holds a key that can unwrap it");
-        await api("/api/clips", { method: "POST", body: JSON.stringify({
-          camera: src.camera, label: src.label, mime: media.mime, iv: enc.iv, ciphertext: enc.ciphertext, wrappedKey, capturedAt: Date.now(),
-        }) });
-        step(3, "server stored: ciphertext only");
-      });
-      onUploaded();
-    } catch (e) {
-      const x = explainTideError(e);
-      setErr({ title: x.refused ? x.summary : `Capture failed: ${e instanceof Error ? e.message : e}`, detail: x.detail });
-    } finally { setBusy(false); }
-  }
-
-  const sceneSource = (sc: Scene): Source => ({ camera: sc.camera, label: sc.label, live: false, produce: (v) => (v ? recordClip(sc) : snapshot(sc)) });
-
-  return (
-    <section className="card">
-      <h2>Cameras</h2>
-      <LiveCamera busy={busy} onCapture={capture} />
-      {/* Progress sits right under the cameras, so a capture visibly does something. */}
-      <Steps steps={steps} />
-      {err && <ErrorBox {...err} />}
-      {preview && <div className="preview"><span className="tag">camera view, before encryption (never uploaded)</span><Media {...preview} /></div>}
-      <p className="muted small">Synthetic cameras. Each button creates a motion event, encrypted on this device before upload.</p>
-      <div className="scene-list">
-        {SCENES.map((sc) => (
-          <div className="scene" key={sc.id}>
-            <div><b>{sc.camera}</b><div className="muted small">{sc.label}</div></div>
-            <div className="row">
-              <button className="btn" disabled={busy} onClick={() => capture(sceneSource(sc), false)}>Snapshot</button>
-              <button className="btn" disabled={busy} onClick={() => capture(sceneSource(sc), true)}>3s clip</button>
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-/** Optional real camera: the DroidCam virtual webcam, a laptop webcam, any videoinput device. */
-function LiveCamera({ busy, onCapture }: { busy: boolean; onCapture: (src: Source, video: boolean) => Promise<void> }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const [on, setOn] = useState(false);
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [deviceId, setDeviceId] = useState("");
-  const [status, setStatus] = useState("");
-  const [err, setErr] = useState("");
-  const [gen, setGen] = useState(0); // bumps on every new stream so the attach effect re-runs
-
-  const stopTracks = () => { streamRef.current?.getTracks().forEach((t) => t.stop()); streamRef.current = null; };
-  useEffect(() => stopTracks, []);
-
-  // Attach the stream once the <video> exists, start playback explicitly, then confirm frames arrive.
-  useEffect(() => {
-    const el = videoRef.current;
-    const s = streamRef.current;
-    if (!on || !el || !s) return;
-    el.srcObject = s;
-    el.play().catch((e) => setErr(`Video playback failed: ${e instanceof Error ? e.message : e}`));
-    setStatus("waiting for picture…");
-    const t = setTimeout(() => {
-      const track = s.getVideoTracks()[0];
-      if (el.videoWidth > 0) setStatus(`receiving frames ${el.videoWidth}×${el.videoHeight} from "${track?.label ?? "camera"}"`);
-      else setStatus(`no picture from "${track?.label ?? "camera"}" (track ${track?.readyState ?? "?"}${track?.muted ? ", muted" : ""}). Is the DroidCam client connected and showing the phone's video?`);
-    }, 2000);
-    return () => clearTimeout(t);
-  }, [on, gen]);
-
-  async function start(id?: string) {
-    setErr(""); setStatus("opening camera…");
-    try {
-      stopTracks();
-      let s = await openCamera(id);
-      // Labels are only readable after permission is granted. Prefer DroidCam when it is there.
-      const cams = await listCameras();
-      setDevices(cams);
-      let active = s.getVideoTracks()[0]?.getSettings().deviceId ?? "";
-      const droid = cams.find((d) => /droidcam/i.test(d.label));
-      if (!id && droid && droid.deviceId !== active) {
-        s.getTracks().forEach((t) => t.stop());
-        s = await openCamera(droid.deviceId);
-        active = droid.deviceId;
-      }
-      streamRef.current = s;
-      setDeviceId(active);
-      setOn(true);
-      setGen((g) => g + 1);
-    } catch (e) {
-      setOn(false); setStatus("");
-      setErr(e instanceof Error ? `${e.name}: ${e.message}` : String(e));
-    }
-  }
-  function stop() { stopTracks(); setOn(false); setStatus(""); }
-
-  const label = devices.find((d) => d.deviceId === deviceId)?.label || "Live camera";
-  const name = /droidcam/i.test(label) ? "Phone cam" : "Live cam";
-  const src: Source = {
-    camera: name, label: "Live capture", live: true,
-    produce: async (v) => {
-      const el = videoRef.current;
-      if (!el || !streamRef.current) throw new Error("Start the camera first.");
-      if (el.videoWidth === 0) throw new Error(`The camera "${label}" is not sending a picture yet, so there is nothing to capture.`);
-      return v ? liveClip(el, name) : liveSnapshot(el, name);
-    },
-  };
-
-  return (
-    <div className="live-cam">
-      <div className="row spread">
-        <div><b>Live camera</b> <span className="muted small">(optional: DroidCam or a webcam)</span></div>
-        {!on
-          ? <button className="btn" onClick={() => start()}>Start camera</button>
-          : <button className="btn ghost" onClick={stop}>Stop</button>}
-      </div>
-      {on && (
-        <>
-          <label className="muted tiny">Camera:{" "}
-            <select className="select" value={deviceId} onChange={(e) => void start(e.target.value)}>
-              {devices.map((d, i) => <option key={d.deviceId || i} value={d.deviceId}>{d.label || `camera ${i + 1}`}</option>)}
-            </select>
-          </label>
-          <video ref={videoRef} className="media live-preview" autoPlay muted playsInline />
-          {status && <div className="muted tiny">{status}</div>}
-          <div className="row">
-            <button className="btn primary" disabled={busy} onClick={() => void onCapture(src, false)}>Snapshot</button>
-            <button className="btn primary" disabled={busy} onClick={() => void onCapture(src, true)}>Record 3s</button>
-            <span className="muted tiny">Point it at something non-personal (a desk, a toy). Never film people for the demo.</span>
-          </div>
-          <MotionPanel videoRef={videoRef} camera={name} onCapture={onCapture} />
-        </>
-      )}
-      {err && (
-        <ErrorBox
-          title="Could not open the camera"
-          detail={`${err}\n\nAllow camera access for localhost:5173. For DroidCam: start the DroidCam client on Windows and connect it to the phone first, then choose "DroidCam Source" here.`}
-        />
-      )}
-    </div>
-  );
-}
-
-/** Arm/disarm motion-triggered recording on the live feed. Clips upload one at a time. */
-function MotionPanel({ videoRef, camera, onCapture }: {
-  videoRef: React.RefObject<HTMLVideoElement | null>;
-  camera: string;
-  onCapture: (src: Source, video: boolean) => Promise<void>;
-}) {
-  const [armed, setArmed] = useState(false);
-  const [sensitivity, setSensitivity] = useState(60);
-  const sensRef = useRef(sensitivity);
-  sensRef.current = sensitivity;
-  const [meter, setMeter] = useState({ level: 0, threshold: thresholdFor(60) });
-  const [state, setState] = useState<{ s: MotionState; ms?: number }>({ s: "watching" });
-  const [count, setCount] = useState(0);
-  const [queued, setQueued] = useState(0);
-  const [err, setErr] = useState("");
-  const queue = useRef<Promise<void>>(Promise.resolve());
-  // The parent re-creates onCapture on every render; keep the latest in a ref so the watcher is
-  // only re-armed when the user toggles it, not on every progress update.
-  const captureRef = useRef(onCapture);
-  captureRef.current = onCapture;
-
-  useEffect(() => {
-    const el = videoRef.current;
-    if (!armed || !el) return;
-    setErr("");
-    const w = watchMotion(el, camera, () => sensRef.current, {
-      onLevel: (level, threshold) => setMeter({ level, threshold }),
-      onState: (s, ms) => setState({ s, ms }),
-      onError: (e) => setErr(e instanceof Error ? e.message : String(e)),
-      onClip: (media, seconds) => {
-        setCount((n) => n + 1);
-        setQueued((n) => n + 1);
-        const src: Source = {
-          camera, label: `Motion detected (${seconds}s)`, live: true,
-          first: `Motion detected: camera recorded ${seconds}s automatically`,
-          produce: async () => media,
-        };
-        // Serialise uploads so overlapping events don't trample each other's progress.
-        queue.current = queue.current.then(() => captureRef.current(src, true)).finally(() => setQueued((n) => n - 1));
-      },
-    });
-    return () => w.stop();
-  }, [armed, camera, videoRef]);
-
-  const pct = Math.min(100, (meter.level / Math.max(meter.threshold * 2, 0.01)) * 100);
-  const mark = 50; // the threshold sits at the middle of the bar
-  const label = !armed ? "Disarmed"
-    : state.s === "warming" ? "Warming up…"
-    : state.s === "recording" ? `● Recording ${((state.ms ?? 0) / 1000).toFixed(1)}s`
-    : state.s === "cooldown" ? "Saving clip…"
-    : "Watching for motion";
-
-  return (
-    <div className="motion">
-      <div className="row spread">
-        <label className="row small">
-          <input type="checkbox" checked={armed} onChange={(e) => setArmed(e.target.checked)} />
-          <b>Motion detection</b>
-        </label>
-        <span className={`motion-state ${armed ? state.s : "off"}`}>{label}</span>
-      </div>
-      {armed && (
-        <>
-          <div className="meter" title={`motion ${(meter.level * 100).toFixed(1)}% of pixels, trigger at ${(meter.threshold * 100).toFixed(1)}%`}>
-            <div className={`meter-fill ${meter.level >= meter.threshold ? "hot" : ""}`} style={{ width: `${pct}%` }} />
-            <div className="meter-mark" style={{ left: `${mark}%` }} />
-          </div>
-          <label className="row tiny muted">
-            Sensitivity
-            <input type="range" min={1} max={100} value={sensitivity} onChange={(e) => setSensitivity(Number(e.target.value))} />
-            {sensitivity}
-          </label>
-          <div className="muted tiny">
-            Starts recording on motion, stops after 2s of stillness (max 15s). Each clip is encrypted on this device before upload.
-            {count > 0 && ` ${count} motion event${count > 1 ? "s" : ""} recorded${queued > 0 ? `, ${queued} uploading` : ""}.`}
-          </div>
-        </>
-      )}
-      {err && <ErrorBox title="Motion detection error" detail={err} />}
-    </div>
-  );
-}
-
-function Gallery({ clips, error }: { clips: ClipMeta[] | null; error: string }) {
+function Gallery({ me, clips, error, onChanged }: { me: Me; clips: ClipMeta[] | null; error: string; onChanged: () => void }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [camera, setCamera] = useState("all");
+  const [kind, setKind] = useState<"all" | "video" | "snapshot">("all");
+  const [selecting, setSelecting] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const cameras = [...new Set((clips ?? []).map((c) => c.camera))].sort();
+  const shown = (clips ?? []).filter((c) =>
+    (camera === "all" || c.camera === camera) &&
+    (kind === "all" || (kind === "video") === c.mime.startsWith("video/")));
+  const deletable = shown.filter((c) => canDelete(me, c));
+
+  function toggle(id: string) {
+    setPicked((p) => { const n = new Set(p); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  }
+  async function removePicked() {
+    const ids = [...picked];
+    if (!ids.length || !window.confirm(`Delete ${ids.length} clip${ids.length === 1 ? "" : "s"} permanently? This can't be undone.`)) return;
+    setBusy(true);
+    try {
+      const r = await deleteClips(ids);
+      setMsg(`Deleted ${r.deleted.length}${r.refused.length ? `; ${r.refused.length} not yours to delete` : ""}.`);
+      setPicked(new Set()); setSelecting(false);
+      if (open && r.deleted.includes(open)) setOpen(null);
+      onChanged();
+    } catch (e) { setMsg(`Delete failed: ${e instanceof Error ? e.message : e}`); }
+    finally { setBusy(false); }
+  }
+
+  const openClip = clips?.find((c) => c.id === open) ?? null;
+
   return (
     <section className="card">
-      <h2>Motion events</h2>
+      <div className="row spread">
+        <h2>Motion events</h2>
+        {clips && clips.length > 0 && (
+          <button className="btn ghost" onClick={() => { setSelecting((s) => !s); setPicked(new Set()); }}>{selecting ? "Cancel" : "Select"}</button>
+        )}
+      </div>
       {error === "forbidden" && <p className="muted">The server refused (403): you're not a household member.</p>}
       {error && error !== "forbidden" && <ErrorBox title="Could not load events" detail={error} />}
-      {clips && clips.length === 0 && <p className="muted">No events yet. Use the camera simulator.</p>}
+      {clips && clips.length === 0 && <p className="muted">No events yet. Start a camera above and take a snapshot, or turn on motion detection.</p>}
+      {clips && clips.length > 0 && (
+        <div className="row filters">
+          <select className="select" value={camera} onChange={(e) => setCamera(e.target.value)}>
+            <option value="all">All cameras</option>
+            {cameras.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <select className="select" value={kind} onChange={(e) => setKind(e.target.value as typeof kind)}>
+            <option value="all">Snapshots and videos</option>
+            <option value="video">Videos only</option>
+            <option value="snapshot">Snapshots only</option>
+          </select>
+          <span className="muted tiny">{shown.length} of {clips.length}</span>
+        </div>
+      )}
+      {selecting && (
+        <div className="row select-bar">
+          <button className="btn ghost" onClick={() => setPicked(new Set(deletable.map((c) => c.id)))}>Select all{deletable.length < shown.length ? " mine" : ""} ({deletable.length})</button>
+          <button className="btn danger" disabled={busy || picked.size === 0} onClick={removePicked}>Delete selected ({picked.size})</button>
+        </div>
+      )}
       <div className="gallery">
-        {clips?.map((c) => (
-          <button key={c.id} className={`event ${open === c.id ? "selected" : ""}`} onClick={() => setOpen(c.id)}>
-            <div className="thumb locked">
-              <span className="lock">🔒</span>
-              <span className="tiny">{c.mime.startsWith("video") ? "VIDEO" : "SNAPSHOT"} · {kb(c.bytes)}</span>
-            </div>
-            <div className="event-meta">
-              <b>{c.camera}</b>
-              <span className="muted small">{c.label}</span>
-              <span className="muted tiny">{when(c.capturedAt)}</span>
-            </div>
-          </button>
-        ))}
+        {shown.map((c) => {
+          const sel = picked.has(c.id);
+          const may = canDelete(me, c);
+          return (
+            <button key={c.id} className={`event ${open === c.id && !selecting ? "selected" : ""} ${sel ? "picked" : ""}`}
+              disabled={selecting && !may} title={selecting && !may ? "Only owners or the uploader can delete this" : undefined}
+              onClick={() => (selecting ? toggle(c.id) : setOpen(c.id))}>
+              <div className="thumb locked">
+                {selecting && <span className="pick">{sel ? "☑" : "☐"}</span>}
+                <span className="lock">🔒</span>
+                <span className="tiny">{c.mime.startsWith("video") ? "VIDEO" : "SNAPSHOT"} · {kb(c.bytes)}</span>
+              </div>
+              <div className="event-meta">
+                <b>{c.camera}</b>
+                <span className="muted small">{c.label}</span>
+                <span className="muted tiny">{when(c.capturedAt)} · {c.uploadedBy}</span>
+              </div>
+            </button>
+          );
+        })}
       </div>
-      {open && <Viewer id={open} key={open} />}
+      {msg && <p className="small">{msg}</p>}
+      {openClip && !selecting && (
+        <Viewer key={openClip.id} clip={openClip} canDelete={canDelete(me, openClip)}
+          onDeleted={() => { setOpen(null); setMsg("Clip deleted."); onChanged(); }} />
+      )}
     </section>
   );
 }
 
-function Viewer({ id }: { id: string }) {
+// `local`: play the household's own copy instead of CamCo's (e.g. CamCo no longer has it).
+function Viewer({ clip: meta, canDelete, onDeleted, local }: { clip: ClipMeta; canDelete: boolean; onDeleted: () => void; local?: LocalClip }) {
   const { steps, run } = useSteps();
   const [media, setMedia] = useState<{ bytes: Uint8Array; mime: string } | null>(null);
   const [err, setErr] = useState<{ title: string; detail?: string } | null>(null);
+  // One object URL per decrypted clip, released when it changes or the viewer closes.
+  const [saveUrl, setSaveUrl] = useState("");
+  useEffect(() => {
+    if (!media) return;
+    const u = URL.createObjectURL(new Blob([media.bytes as BlobPart], { type: media.mime }));
+    setSaveUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [media]);
   async function play() {
     setErr(null); setMedia(null);
     try {
-      await run(["Download ciphertext + wrapped key from CamCo cloud", "Ask the Tide network to unwrap the clip key (it checks your roles against the vault policy)", "Decrypt the clip locally with AES-GCM"], async (step) => {
-        const clip = await api<Clip>(`/api/clips/${id}`);
+      await run([local ? "Read the household's own encrypted copy (not CamCo's)" : "Download ciphertext + wrapped key from CamCo cloud", "Ask the Tide network to unwrap the clip key (it checks your roles against the vault policy)", "Decrypt the clip locally with AES-GCM"], async (step) => {
+        const clip: Clip = local ?? await api<Clip>(`/api/clips/${meta.id}`);
         step(0, kb(clip.bytes));
         const rawKey = await unwrapKey(clip.wrappedKey, await vaultPolicy());
         step(1, "policy check passed on the Tide network");
@@ -382,13 +220,89 @@ function Viewer({ id }: { id: string }) {
       setErr({ title: x.summary, detail: x.detail });
     }
   }
+  async function remove() {
+    if (!window.confirm(`Delete this ${meta.mime.startsWith("video") ? "video" : "snapshot"} from ${meta.camera} permanently?`)) return;
+    try {
+      const r = await deleteClips([meta.id]);
+      if (r.deleted.includes(meta.id)) onDeleted();
+      else setErr({ title: "Not deleted: only owners or the person who recorded it can delete it." });
+    } catch (e) { setErr({ title: `Delete failed: ${e instanceof Error ? e.message : e}` }); }
+  }
   useEffect(() => { void play(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="viewer">
+      <div className="row spread">
+        <span className="small"><b>{meta.camera}</b> · {meta.label} · <span className="muted">{when(meta.capturedAt)} by {meta.uploadedBy}</span></span>
+        {canDelete && <button className="btn danger" onClick={remove}>Delete</button>}
+      </div>
       <Steps steps={steps} />
       {media && <Media {...media} />}
+      {media && saveUrl && (
+        <a className="btn ghost" download={`${meta.camera}-${new Date(meta.capturedAt).toISOString().replace(/[:.]/g, "-")}.${meta.mime.startsWith("video") ? "webm" : meta.mime.includes("png") ? "png" : "jpg"}`}
+          href={saveUrl} title="A saved copy is no longer protected by the vault">Save decrypted copy</a>
+      )}
       {err && <ErrorBox {...err} />}
     </div>
+  );
+}
+
+interface Storage {
+  quotaBytes: number; usedBytes: number; clips: number; snapshots: number; videos: number;
+  oldest: number | null; newest: number | null; retentionDays: number | null; retentionChoices: number[];
+  perCamera: { camera: string; clips: number; bytes: number; snapshots: number; videos: number; newest: number }[];
+}
+
+const size = (b: number) => (b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : kb(b));
+
+function StoragePanel({ me, version }: { me: Me; version: number }) {
+  const [s, setS] = useState<Storage | null>(null);
+  const [msg, setMsg] = useState("");
+  const load = useCallback(() => api<Storage>("/api/storage").then(setS).catch((e) => setMsg(String(e.message ?? e))), []);
+  useEffect(() => { void load(); }, [load, version]);
+
+  async function setRetention(v: string) {
+    const days = v === "" ? null : Number(v);
+    if (days && !window.confirm(`Automatically delete clips older than ${days} days, starting now?`)) return;
+    try {
+      const r = await api<{ retentionDays: number | null; pruned: number }>("/api/storage/retention", { method: "PUT", body: JSON.stringify({ days }) });
+      setMsg(r.pruned ? `Retention updated. ${r.pruned} older clip(s) deleted.` : "Retention updated.");
+      void load();
+    } catch (e) { setMsg(`Could not change retention: ${e instanceof Error ? e.message : e}`); }
+  }
+
+  if (!s) return <section className="card"><h2>Storage</h2><p className="muted">{msg || "Loading…"}</p></section>;
+  const pct = Math.min(100, (s.usedBytes / s.quotaBytes) * 100);
+  return (
+    <section className="card">
+      <h2>Storage</h2>
+      <div className="usage">
+        <div className="row spread small"><b>{size(s.usedBytes)} used</b><span className="muted">of {size(s.quotaBytes)}</span></div>
+        <div className="meter"><div className={`meter-fill ${pct > 90 ? "hot" : ""}`} style={{ width: `${Math.max(pct, s.usedBytes ? 1 : 0)}%` }} /></div>
+        <div className="muted tiny">
+          {s.clips} clip{s.clips === 1 ? "" : "s"} ({s.snapshots} snapshot{s.snapshots === 1 ? "" : "s"}, {s.videos} video{s.videos === 1 ? "" : "s"})
+          {s.oldest && ` · oldest ${when(s.oldest)}`}
+        </div>
+      </div>
+      {s.perCamera.length > 0 && (
+        <table className="raw">
+          <thead><tr><th>camera</th><th>clips</th><th>stored</th><th>latest</th></tr></thead>
+          <tbody>
+            {s.perCamera.map((c) => (
+              <tr key={c.camera}><td>{c.camera}</td><td>{c.clips}<span className="muted tiny"> ({c.videos} video)</span></td><td>{size(c.bytes)}</td><td className="tiny">{when(c.newest)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <label className="small retention">Keep clips
+        <select className="select" value={s.retentionDays ?? ""} disabled={!me.isOwner} onChange={(e) => void setRetention(e.target.value)}>
+          <option value="">until someone deletes them</option>
+          {s.retentionChoices.map((d) => <option key={d} value={d}>for {d} days</option>)}
+        </select>
+      </label>
+      {!me.isOwner && <span className="muted tiny">Only owners can change retention.</span>}
+      <p className="muted tiny">Sizes are of the encrypted copies CamCo stores. CamCo can delete ciphertext (to enforce your retention rule) but never open it.</p>
+      {msg && <p className="small">{msg}</p>}
+    </section>
   );
 }
 
@@ -571,6 +485,175 @@ function Members({ me }: { me: Me }) {
       </form>
       <p className="muted tiny">New people start with no access. Removal takes effect at that person's next sign-in, or within about 10 minutes when their login refreshes. Anything they already saved from the screen can't be clawed back.</p>
       {out && <p className="small">{out}</p>}
+    </section>
+  );
+}
+
+interface Notice { at: number; who: string; what: string; detail: string }
+
+/** What CamCo did that touched this household, and any legal requests about it. */
+function Notices() {
+  const [list, setList] = useState<Notice[] | null>(null);
+  useEffect(() => {
+    const load = () => api<Notice[]>("/api/household/notices").then(setList).catch(() => setList([]));
+    void load();
+    const t = setInterval(load, 10000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <section className="card span-all">
+      <h2>CamCo activity on your household</h2>
+      <p className="muted small">Every time CamCo touches your household (asking for access, trying to force an approval, issuing a setup link, receiving a legal request), it shows up here.</p>
+      {list && list.length === 0 && <p className="muted">Nothing yet.</p>}
+      <div className="cr-list">
+        {list?.map((n, i) => (
+          <div key={i} className="notice">
+            <div className="row spread"><b className="small">{n.what.startsWith("legal-request") ? "⚖️ Legal request" : "CamCo"} · {n.who}</b><span className="muted tiny">{when(n.at)}</span></div>
+            <span className="small">{n.detail}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+interface Tombstone { id: string; at: number; by: string; reason: string }
+
+/**
+ * The household's own copy of its footage, and the check that CamCo still holds everything.
+ * A clip this device has but CamCo's cloud doesn't, with no household deletion recorded, was lost
+ * or deleted on CamCo's side: it's flagged, can be played from the household copy, and restored.
+ */
+function HouseholdCopy({ clips, onChanged }: { clips: ClipMeta[] | null; onChanged: () => void }) {
+  const hh = tenant().info.id;
+  const [local, setLocal] = useState<LocalClip[] | null>(null);
+  const [tombs, setTombs] = useState<Map<string, Tombstone>>(new Map());
+  const [enabled, setEnabled] = useState(() => localCopyEnabled(hh));
+  const [folder, setFolder] = useState<{ name: string; ready: boolean } | null>(null);
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState("");
+  const [view, setView] = useState<LocalClip | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [mine, t] = await Promise.all([listClips(hh), api<Tombstone[]>("/api/clips/tombstones")]);
+      const tmap = new Map(t.map((x) => [x.id, x]));
+      // The household deleted these (perhaps on another device): honour it here too.
+      const deleted = mine.filter((c) => tmap.has(c.id)).map((c) => c.id);
+      if (deleted.length) await deleteLocal(deleted);
+      setTombs(tmap);
+      setLocal(mine.filter((c) => !tmap.has(c.id)));
+      const h = await getFolder(hh);
+      setFolder(h ? { name: h.name, ready: await folderReady(h, false) } : null);
+    } catch (e) { setMsg(`Household copy unavailable: ${e instanceof Error ? e.message : e}`); }
+  }, [hh]);
+  useEffect(() => { void load(); }, [load, clips]);
+
+  const cloud = new Set((clips ?? []).map((c) => c.id));
+  const known = clips !== null && local !== null;
+  const missing = known ? local!.filter((c) => !cloud.has(c.id)) : [];
+  const notLocal = known ? clips!.filter((c) => !local!.some((l) => l.id === c.id)) : [];
+  const localBytes = (local ?? []).reduce((n, c) => n + c.bytes, 0);
+
+  async function restore(list: LocalClip[]) {
+    setBusy("restore"); setMsg("");
+    let ok = 0, failed = 0;
+    for (const c of list) {
+      try {
+        await api("/api/clips", { method: "POST", body: JSON.stringify({
+          id: c.id, cameraId: c.cameraId, camera: c.camera, label: c.label, mime: c.mime, iv: c.iv, ciphertext: c.ciphertext,
+          wrappedKey: c.wrappedKey, capturedAt: c.capturedAt, restore: true,
+        }) });
+        await markInCloud(c.id, true); ok++;
+      } catch { failed++; }
+    }
+    setMsg(`Restored ${ok} clip${ok === 1 ? "" : "s"} to CamCo's cloud${failed ? `; ${failed} failed` : ""}.`);
+    setBusy(""); onChanged(); void load();
+  }
+
+  async function backUpExisting() {
+    setBusy("backup"); setMsg("");
+    const h = await getFolder(hh).catch(() => undefined);
+    const toFolder = h ? await folderReady(h, true) : false;
+    let n = 0;
+    for (const m of notLocal) {
+      try {
+        const c = await api<Clip>(`/api/clips/${m.id}`);
+        const rec: LocalClip = { ...c, household: hh, savedAt: Date.now(), inCloud: true };
+        await putClip(rec);
+        if (h && toFolder) await writeToFolder(h, rec);
+        n++;
+      } catch { /* keep going */ }
+    }
+    setMsg(`Copied ${n} clip${n === 1 ? "" : "s"} from CamCo's cloud to this device${h && toFolder ? " and the backup folder" : ""}.`);
+    setBusy(""); void load();
+  }
+
+  async function pickFolder() {
+    setMsg("");
+    try {
+      const h = await chooseFolder(hh);
+      setBusy("folder");
+      const all = await listClips(hh);
+      for (const c of all) await writeToFolder(h, c);
+      setMsg(`Backup folder set to "${h.name}". ${all.length} encrypted clip file${all.length === 1 ? "" : "s"} written; new clips are added automatically.`);
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === "AbortError")) setMsg(`Could not use that folder: ${e instanceof Error ? e.message : e}`);
+    } finally { setBusy(""); void load(); }
+  }
+
+  async function regrant() {
+    const h = await getFolder(hh);
+    if (h && (await folderReady(h, true))) setMsg("Backup folder permission granted again.");
+    void load();
+  }
+
+  function toggle(on: boolean) {
+    setLocalCopyEnabled(hh, on);
+    setEnabled(on);
+  }
+
+  return (
+    <section className="card span-all">
+      <div className="row spread">
+        <h2>Household copy</h2>
+        <label className="row small"><input type="checkbox" checked={enabled} onChange={(e) => toggle(e.target.checked)} /> Keep encrypted copies on this device</label>
+      </div>
+      <p className="muted small">CamCo's cloud shouldn't be the only copy of your footage. This device keeps its own encrypted copy of every clip it records (still unreadable without your household's Tide-governed key), and checks that CamCo still holds everything.</p>
+
+      {known && missing.length > 0 && (
+        <div className="big-status bad">
+          ⚠ {missing.length} clip{missing.length === 1 ? " is" : "s are"} missing from CamCo's cloud: not deleted by your household
+          <div className="tiny">No deletion by your household is recorded. Your household copy is intact.</div>
+          <div className="cr-list">
+            {missing.map((c) => (
+              <div key={c.id} className="row spread missing-row">
+                <span className="small"><b>{c.camera}</b> · {c.label} · {when(c.capturedAt)} · <i>{c.inCloud ? "CamCo removed or lost its copy" : "its upload never finished"}</i></span>
+                <button className="btn ghost" onClick={() => setView(c)}>View household copy</button>
+              </div>
+            ))}
+          </div>
+          <button className="btn primary" disabled={!!busy} onClick={() => restore(missing)}>{busy === "restore" ? "Restoring…" : `Restore ${missing.length} to CamCo's cloud`}</button>
+        </div>
+      )}
+      {known && missing.length === 0 && local!.length > 0 && <div className="big-status ok">✓ CamCo's cloud holds every clip this device has a copy of.</div>}
+
+      <div className="tiles">
+        <div className="tile"><span className="tile-label">On this device</span><b>{local?.length ?? "…"} clips</b><span className="tiny muted">{(localBytes / 1024 / 1024).toFixed(1)} MB encrypted</span></div>
+        <div className="tile"><span className="tile-label">Not yet copied here</span><b>{known ? notLocal.length : "…"}</b><span className="tiny muted">older, or from other devices</span></div>
+        <div className={`tile ${folder && !folder.ready ? "bad" : ""}`}><span className="tile-label">Backup folder</span><b>{folder ? folder.name : "none"}</b><span className="tiny muted">{folder ? (folder.ready ? "new clips written automatically" : "needs permission again") : folderSupported() ? "USB drive or NAS share" : "needs Chrome or Edge"}</span></div>
+        <div className="tile"><span className="tile-label">Deleted by household</span><b>{tombs.size}</b><span className="tiny muted">recorded deletions</span></div>
+      </div>
+
+      <div className="row copy-actions">
+        <button className="btn" disabled={!!busy || !known || notLocal.length === 0} onClick={backUpExisting}>{busy === "backup" ? "Copying…" : `Copy ${notLocal.length} cloud clip${notLocal.length === 1 ? "" : "s"} to this device`}</button>
+        {folderSupported() && <button className="btn" disabled={!!busy} onClick={pickFolder}>{folder ? "Change backup folder" : "Choose backup folder…"}</button>}
+        {folder && !folder.ready && <button className="btn primary" onClick={regrant}>Allow folder access</button>}
+        {folder && <button className="btn ghost" onClick={async () => { await forgetFolder(hh); void load(); }}>Stop using folder</button>}
+      </div>
+      <p className="muted tiny">Deleting a clip in Motion events deletes it everywhere: CamCo's cloud, this device, and other members' devices next time they open the app. Files already in a backup folder are left for you to manage.</p>
+      {msg && <p className="small">{msg}</p>}
+      {view && <Viewer key={view.id} clip={view} local={view} canDelete={false} onDeleted={() => {}} />}
     </section>
   );
 }

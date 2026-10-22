@@ -7,17 +7,21 @@
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { requireAuth, isHousehold, isOwner, type Caller } from "./auth/tide.ts";
-import { db, save, audit, type Clip } from "./db.ts";
+import { db, save, audit, type Clip, type Camera } from "./db.ts";
 import {
   rootCall, listChangeRequests, fileRealmRoleGrant, fileRealmRoleRevoke, fileOwnerGrant, fileCreateUser,
   inviteLink, members, directory, adminPolicy, userByName,
 } from "./tidecloakAdmin.ts";
-import { households, household, adapterOf, publicView, VENDOR_REALM, type Household } from "./households.ts";
-import { startSignup, validateSignup, resumeProvisioning } from "./provision.ts";
+import { households, household, adapterOf, publicView, VENDOR_REALM, isStaffRealm, staffRealm, customerHouseholds, updateHousehold, type Household } from "./households.ts";
+import { startSignup, validateSignup, resumeProvisioning, ensureStaffRealm } from "./provision.ts";
+import { serviceHealth, householdMetadata, fleet, legalRequests, logLegalRequest } from "./ops.ts";
+import { QUOTA_BYTES, RETENTION_CHOICES, usedBytes, storageSummary, removeClips, prune, startRetentionSweep } from "./storage.ts";
 
 const VENDOR_STAFF = (process.env.VENDOR_STAFF || "camco-support").split(",").map((s) => s.trim());
-// CamCo staff sign in to CamCo's own realm. Their username alone means nothing in a customer realm.
-const isVendor = (c: Caller, h: Household) => h.realm === VENDOR_REALM && VENDOR_STAFF.includes(c.username);
+// CamCo staff sign in to CamCo's own staff realm: anyone there is staff. Until that realm's first
+// account is linked, camco-support in the demo realm still works (the legacy vendor login).
+// A username alone means nothing in a customer realm.
+const isVendor = (c: Caller, h: Household) => isStaffRealm(h) || (h.realm === VENDOR_REALM && VENDOR_STAFF.includes(c.username));
 // household-viewer is a composite carrying _tide_decryptor + _tide_encryptor, so joining the
 // household is ONE governed grant (IGA allows one pending change request per user).
 const VIEW_ROLES = ["household-viewer"];
@@ -46,6 +50,13 @@ app.get("/api/households/:id/adapter", (req, res) => {
   const a = h && (h.status === "ready" || h.status === "finalizing") ? adapterOf(h) : null;
   if (!a) return res.status(404).json({ error: h ? `This household is still being set up (${h.status})` : "No household with that code" });
   res.json(a);
+});
+
+// Which realm CamCo staff sign in to (for the /staff page). Not a secret: it holds no customer data.
+app.get("/api/staff-realm", (_req, res) => {
+  const s = staffRealm();
+  if (s?.status === "ready") return res.json({ id: s.id, name: s.name, legacy: false });
+  res.json({ id: VENDOR_REALM, name: "The Demo Household", legacy: true, staffRealmStatus: s?.status ?? "not created" });
 });
 
 // Light abuse control for the one unauthenticated write. Each sign-up creates and licenses a realm.
@@ -122,24 +133,131 @@ app.get("/api/admin-policy", requireAuth(isOwner, "Owners only"), wrap(async (re
   res.json({ policy });
 }));
 
+// --- cameras ---------------------------------------------------------------------------------------
+// Owners register the household's cameras; any member can feed one from a device on their computer.
+app.get("/api/cameras", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  res.json(db(H(req)).cameras);
+});
+
+app.post("/api/cameras", requireAuth(isOwner, "Only owners can add cameras"), (req, res) => {
+  const name = String(req.body?.name ?? "").trim().slice(0, 40);
+  const location = String(req.body?.location ?? "").trim().slice(0, 40);
+  if (!name) return res.status(400).json({ error: "Give the camera a name" });
+  const d = db(H(req));
+  if (d.cameras.length >= 16) return res.status(400).json({ error: "A household can have up to 16 cameras" });
+  if (d.cameras.some((c) => c.name.toLowerCase() === name.toLowerCase())) return res.status(409).json({ error: `There is already a camera called "${name}"` });
+  const cam: Camera = { id: randomUUID(), name, location, addedBy: req.caller!.username, addedAt: Date.now() };
+  d.cameras.push(cam);
+  record(req, "camera.added", `${name}${location ? ` (${location})` : ""}`);
+  res.status(201).json(cam);
+});
+
+app.delete("/api/cameras/:id", requireAuth(isOwner, "Only owners can remove cameras"), (req, res) => {
+  const d = db(H(req));
+  const i = d.cameras.findIndex((c) => c.id === req.params.id);
+  if (i < 0) return res.status(404).json({ error: "No such camera" });
+  const [cam] = d.cameras.splice(i, 1);
+  record(req, "camera.removed", `${cam.name} (its clips are kept)`);
+  res.json({ ok: true });
+});
+
 // --- clips ---------------------------------------------------------------------------------------
 app.post("/api/clips", requireAuth(isHousehold, "Not a household member"), (req, res) => {
-  const { camera, label, mime, iv, ciphertext, wrappedKey, capturedAt } = req.body ?? {};
-  for (const [k, v] of Object.entries({ camera, mime, iv, ciphertext, wrappedKey })) {
+  const { id: wantedId, cameraId, camera: cameraName, label, mime, iv, ciphertext, wrappedKey, capturedAt, restore } = req.body ?? {};
+  for (const [k, v] of Object.entries({ cameraId, mime, iv, ciphertext, wrappedKey })) {
     if (typeof v !== "string" || !v) return res.status(400).json({ error: `${k} is required` });
   }
+  // The household's device saves its own encrypted copy first, under an id it chose, so both
+  // copies share one id. A restore re-uploads that copy after CamCo lost or deleted its own.
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (wantedId !== undefined && (typeof wantedId !== "string" || !UUID.test(wantedId))) return res.status(400).json({ error: "id must be a UUID" });
+  const d = db(H(req));
+  if (wantedId && d.clips.some((c) => c.id === wantedId)) return res.status(409).json({ error: "CamCo's cloud already holds this clip" });
+  const cam = d.cameras.find((c) => c.id === cameraId);
+  // A restored clip may come from a camera that has since been removed: keep its recorded name.
+  if (!cam && !(restore === true && typeof cameraName === "string" && cameraName)) return res.status(400).json({ error: "Unknown camera: it may have been removed" });
+  const camera = cam?.name ?? String(cameraName).slice(0, 40);
+  const bytes = Math.floor((ciphertext.length * 3) / 4);
+  prune(H(req));
+  if (usedBytes(H(req)) + bytes > QUOTA_BYTES) {
+    return res.status(413).json({ error: "This household's storage is full. Delete some clips or shorten the retention period." });
+  }
   const clip: Clip = {
-    id: randomUUID(), camera, label: typeof label === "string" ? label : "Motion detected", mime, iv, ciphertext, wrappedKey,
-    capturedAt: typeof capturedAt === "number" ? capturedAt : Date.now(), uploadedBy: req.caller!.username,
-    bytes: Math.floor((ciphertext.length * 3) / 4),
+    id: wantedId || randomUUID(), camera, cameraId, label: typeof label === "string" ? label : "Motion detected", mime, iv, ciphertext, wrappedKey,
+    capturedAt: typeof capturedAt === "number" ? capturedAt : Date.now(), uploadedBy: req.caller!.username, bytes,
   };
-  db(H(req)).clips.unshift(clip);
-  record(req, "clip.uploaded", `${camera}: ${clip.label} (${clip.bytes} bytes ciphertext)`);
+  d.clips.unshift(clip);
+  d.clips.sort((a, b) => b.capturedAt - a.capturedAt);
+  record(req, restore === true ? "clip.restored" : "clip.uploaded", `${camera}: ${clip.label} (${clip.bytes} bytes ciphertext)${restore === true ? ", restored from a household copy" : ""}`);
   res.status(201).json({ id: clip.id });
 });
 
 app.get("/api/clips", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  prune(H(req));
   res.json(db(H(req)).clips.map(({ ciphertext: _c, wrappedKey: _w, iv: _i, ...meta }) => meta));
+});
+
+// Deleting footage: owners can delete any clip, other members only what they uploaded. Checked
+// against the verified token. Deleting ciphertext gives no one the ability to watch anything.
+const mayDelete = (c: Caller, clip: Clip) => c.isRealmAdmin || clip.uploadedBy === c.username;
+
+app.post("/api/clips/delete", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.map(String).slice(0, 500) : [];
+  if (!ids.length) return res.status(400).json({ error: "ids is required" });
+  const d = db(H(req));
+  const allowed = new Set<string>();
+  const refused: string[] = [];
+  for (const id of ids) {
+    const clip = d.clips.find((c) => c.id === id);
+    if (!clip) continue;
+    if (mayDelete(req.caller!, clip)) allowed.add(id); else refused.push(id);
+  }
+  const removed = removeClips(H(req), allowed, { by: req.caller!.username, reason: "deleted by a household member" });
+  if (removed.length) {
+    const bytes = removed.reduce((n, c) => n + c.bytes, 0);
+    record(req, "clips.deleted", `${removed.length} clip(s), ${Math.round(bytes / 1024)} KB: ${[...new Set(removed.map((c) => c.camera))].join(", ")}`);
+  }
+  res.json({ deleted: removed.map((c) => c.id), refused });
+});
+
+// Deliberate deletions, so a member's device can tell "the household deleted it" from "it vanished".
+app.get("/api/clips/tombstones", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  prune(H(req));
+  res.json((db(H(req)).tombstones ?? []).map((t) => ({ id: t.id, at: t.at, by: t.by, reason: t.reason })));
+});
+
+app.get("/api/storage", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  prune(H(req));
+  res.json({ ...storageSummary(H(req)), retentionChoices: RETENTION_CHOICES });
+});
+
+// --- household settings -----------------------------------------------------------------------------
+// The timezone is display metadata: every time in the app and the stamp on new footage use it.
+const validTimezone = (name: string) => { try { new Intl.DateTimeFormat("en-US", { timeZone: name }); return true; } catch { return false; } };
+
+app.get("/api/settings", requireAuth(), (req, res) => {
+  res.json({ timezone: db(H(req)).timezone ?? null });
+});
+
+app.put("/api/settings/timezone", requireAuth(isOwner, "Only owners can change the household timezone"), (req, res) => {
+  const tz = String(req.body?.timezone ?? "").trim();
+  if (!tz || tz.length > 64 || !validTimezone(tz)) return res.status(400).json({ error: `Unknown timezone "${tz}"` });
+  const before = db(H(req)).timezone ?? "each device's own";
+  db(H(req)).timezone = tz;
+  record(req, "settings.timezone", `household timezone changed from ${before} to ${tz}`);
+  res.json({ timezone: tz });
+});
+
+app.put("/api/storage/retention", requireAuth(isOwner, "Only owners can change retention"), (req, res) => {
+  const raw = req.body?.days;
+  const days = raw === null || raw === "" || raw === undefined ? null : Number(raw);
+  if (days !== null && !(RETENTION_CHOICES as readonly number[]).includes(days)) {
+    return res.status(400).json({ error: `days must be one of ${RETENTION_CHOICES.join(", ")} or null` });
+  }
+  db(H(req)).retentionDays = days;
+  record(req, "retention.changed", days ? `clips older than ${days} days are deleted automatically` : "clips are kept until someone deletes them");
+  const pruned = prune(H(req));
+  res.json({ retentionDays: days, pruned });
 });
 
 app.get("/api/clips/:id", requireAuth(isHousehold, "Not a household member"), (req, res) => {
@@ -213,22 +331,71 @@ app.get("/api/household/members", requireAuth(isOwner, "Owners only"), wrap(asyn
   res.json(await members(H(req).realm, H(req).realm === VENDOR_REALM ? VENDOR_STAFF : []));
 }));
 
+// Everything CamCo did that touched this household, plus legal requests about it: transparency.
+app.get("/api/household/notices", requireAuth(isHousehold, "Not a household member"), (req, res) => {
+  res.json(db(H(req)).audit.filter((a) => a.what.startsWith("vendor.") || a.what.startsWith("legal-request.")).slice(0, 30));
+});
+
 app.get("/api/audit", requireAuth((c, h) => isHousehold(c) || isVendor(c, h)), (req, res) => { res.json(db(H(req)).audit.slice(0, 50)); });
 
 // --- vendor console (CamCo staff) ----------------------------------------------------------------
 // CamCo owns this database and runs TideCloak, so its console shows every household's raw rows and
 // holds root on every realm. That's the honest premise. None of it opens a clip.
 const vendorOnly = requireAuth(isVendor, "CamCo staff only");
+// Vendor actions are written into the TARGET household's own log, so the family sees them.
+const recordIn = (target: Household, req: Request, what: string, detail: string) => { audit(target, `CamCo (${req.caller!.username})`, what, detail); save(target); };
 function targetOf(req: Request) {
-  const id = String(req.query.household ?? req.body?.household ?? VENDOR_REALM);
+  const id = String(req.query.household ?? req.body?.household ?? customerHouseholds()[0]?.id ?? VENDOR_REALM);
   const h = household(id);
   if (!h) throw new Error(`No household ${id}`);
   return h;
 }
 
 app.get("/api/vendor/households", vendorOnly, (_req, res) => {
-  res.json(households().map((h) => ({ ...publicView(h), realm: h.realm, clips: db(h).clips.length, vault: !!db(h).vaultPolicy })));
+  res.json(customerHouseholds().map((h) => ({
+    ...publicView(h), realm: h.realm, owner: h.owner, clips: db(h).clips.length, vault: !!db(h).vaultPolicy, ...householdMetadata(h),
+  })));
 });
+
+app.get("/api/vendor/ops", vendorOnly, wrap(async (_req, res) => { res.json(await serviceHealth()); }));
+
+app.get("/api/vendor/fleet", vendorOnly, wrap(async (req, res) => { res.json(fleet(targetOf(req))); }));
+
+// The threat this demonstrates: CamCo can destroy ciphertext on its own disks (a bug, a rogue
+// admin, a breach). It leaves no tombstone and isn't written to the household's log, exactly as
+// a quiet deletion wouldn't be. The household's own copies are how footage survives it.
+app.post("/api/vendor/clips/:id/destroy", vendorOnly, wrap(async (req, res) => {
+  const target = targetOf(req);
+  const removed = removeClips(target, new Set([String(req.params.id)]), null);
+  if (!removed.length) return res.status(404).json({ error: "No such clip" });
+  save(target);
+  audit(H(req), req.caller!.username, "vendor.destroyed-ciphertext", `${target.id}: ${removed[0].camera} ${removed[0].id} (no tombstone)`);
+  save(H(req));
+  res.json({ destroyed: removed[0].id });
+}));
+
+// Onboarding support: a customer lost their setup link. Root can issue a fresh one only while the
+// owner has not created their Tide account; after that, nobody at CamCo can stand in for them.
+app.post("/api/vendor/households/:id/reissue-link", vendorOnly, wrap(async (req, res) => {
+  const h = household(String(req.params.id));
+  if (!h || isStaffRealm(h)) return res.status(404).json({ error: "No such household" });
+  if (h.status !== "awaiting-owner") return res.status(409).json({ error: `Only possible while the household waits for its owner (it is ${h.status}).` });
+  const link = await inviteLink(h.realm, h.owner!);
+  updateHousehold(h.id, { inviteLink: link });
+  recordIn(h, req, "vendor.reissue-link", `issued a fresh setup link for ${h.owner}`);
+  res.json({ link });
+}));
+
+app.get("/api/vendor/legal-requests", vendorOnly, (_req, res) => { res.json(legalRequests()); });
+
+app.post("/api/vendor/legal-requests", vendorOnly, wrap(async (req, res) => {
+  const target = targetOf(req);
+  const requester = String(req.body?.requester ?? "").trim();
+  const reference = String(req.body?.reference ?? "").trim();
+  const scope = String(req.body?.scope ?? "").trim();
+  if (!requester || !reference || !scope) return res.status(400).json({ error: "requester, reference and scope are required" });
+  res.status(201).json(logLegalRequest(req.caller!.username, target, { requester, reference, scope }));
+}));
 
 app.get("/api/vendor/records", vendorOnly, wrap(async (req, res) => {
   const d = db(targetOf(req));
@@ -247,11 +414,11 @@ app.post("/api/vendor/self-grant", vendorOnly, wrap(async (req, res) => {
   if (!(await userByName(target.realm, me))) {
     const created = await fileCreateUser(target.realm, me, "CamCo Support");
     const changeRequests = (await listChangeRequests(target.realm)).filter((c) => c.actionType === "CREATE_USER").slice(-1);
-    record(req, "vendor.self-grant", `root files CREATE_USER ${me} in ${target.id} -> HTTP ${created.status}`);
+    recordIn(target, req, "vendor.self-grant", `root filed an account for ${me} in your household (HTTP ${created.status}). It needs your approval.`);
     return res.json({ results: [{ role: `account in ${target.name}`, status: created.status, changeRequestId: changeRequests[0]?.id }], changeRequests });
   }
   const out = await fileRealmRoleGrant(target.realm, me, VIEW_ROLES);
-  record(req, "vendor.self-grant", `root grants ${out.results.map((r) => `${r.role}=${r.status || r.note}`).join(", ")} to ${me} in ${target.id}`);
+  recordIn(target, req, "vendor.self-grant", `root asked to give ${me} ${out.results.map((r) => `${r.role} (HTTP ${r.status || r.note})`).join(", ")}. It needs your approval.`);
   res.json(out);
 }));
 
@@ -265,7 +432,7 @@ app.post("/api/vendor/cr/:id/force", vendorOnly, wrap(async (req, res) => {
     attempts.push({ lane, status: r.status, body: r.body });
   }
   const after = (await rootCall(target.realm, "GET", `/iga/change-requests/${id}`)).body;
-  record(req, "vendor.force-approve", `${target.id}: ${attempts.map((a) => `${a.lane}=${a.status}`).join(", ")}`);
+  recordIn(target, req, "vendor.force-approve", `root tried to approve its own request: ${attempts.map((a) => `${a.lane} → HTTP ${a.status}`).join(", ")}`);
   res.json({ attempts, changeRequest: after });
 }));
 
@@ -275,4 +442,6 @@ app.listen(PORT, (err?: Error) => {
   if (err) { console.error(`camera-vault server failed to start: ${err.message}`); process.exit(1); }
   console.log(`camera-vault server on http://localhost:${PORT} (${households().length} household(s))`);
   resumeProvisioning();
+  startRetentionSweep();
+  ensureStaffRealm();
 });
